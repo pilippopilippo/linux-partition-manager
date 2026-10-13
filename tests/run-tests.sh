@@ -22,7 +22,6 @@ if (( EUID != 0 )); then
 fi
 
 WORK=$(mktemp -d /tmp/pw-tests.XXXXXX)
-LOOPS=()
 PASS=0
 FAIL=0
 SKIP=0
@@ -42,7 +41,7 @@ PW_INCLUDE_LOOP=1
 ui_init
 
 cleanup_tests() {
-    local l m
+    local l f m
     for m in $(findmnt -rn -o TARGET | grep -E "^($WORK|/tmp/partition-wizard\.)" | sort -r); do
         umount "$m" 2>/dev/null
     done
@@ -50,10 +49,14 @@ cleanup_tests() {
         vgchange -an pwtestvg >/dev/null 2>&1
         vgremove -f pwtestvg >/dev/null 2>&1
     fi
-    for l in "${LOOPS[@]}"; do
-        swapoff "$l"* 2>/dev/null
+    [[ -e /dev/mapper/pwtestcrypt ]] && cryptsetup close pwtestcrypt 2>/dev/null
+    # new_disk runs in a subshell, so the loop devices are found through
+    # their backing files
+    while read -r l f; do
+        [[ $f == "$WORK"/* ]] || continue
+        swapoff "$l"p* 2>/dev/null
         losetup -d "$l" 2>/dev/null
-    done
+    done < <(losetup -nO NAME,BACK-FILE 2>/dev/null)
     rm -rf "$WORK"
 }
 trap cleanup_tests EXIT
@@ -86,7 +89,6 @@ new_disk() {   # size -> prints the loop device
     img=$(mktemp "$WORK/disk.XXXXXX.img")
     truncate -s "$1" "$img"
     l=$(losetup -fP --show "$img") || return 1
-    LOOPS+=("$l")
     printf '%s\n' "$l"
 }
 
@@ -154,6 +156,14 @@ test_units() {
     compute_end -1M 2048 8191 8191 shrink 0
     check_eq "compute_end -1M (shrink)" 6143 "$NEW_END"
     check "compute_end enforces the minimum when shrinking" not compute_end 1M 2048 8191 8191 shrink 2097152
+
+    check "valid mount point /srv/data" valid_mount_point /srv/data
+    check "valid mount point /mnt/disk_2.backup" valid_mount_point /mnt/disk_2.backup
+    check "mount point / rejected" not valid_mount_point /
+    check "relative mount point rejected" not valid_mount_point data
+    check "mount point with spaces rejected" not valid_mount_point "/mnt/my data"
+    check "mount point with # rejected" not valid_mount_point "/mnt/a#b"
+    check "mount point with .. rejected" not valid_mount_point /mnt/../etc
 
     # Text must render on terminals without a UTF-8 locale
     check "the script contains only ASCII characters" not env LC_ALL=C grep -q '[^[:print:][:space:]]' "$SCRIPT"
@@ -374,6 +384,147 @@ test_btrfs() {
     check_eq "btrfs: file system = partition" "$(mib 300)" "$total"
 }
 
+# --- MBR: deleting a logical partition renumbers the following ones ----------------
+
+test_mbr_logical_delete() {
+    echo "== MBR: deleting a logical partition"
+    local d dn
+    d=$(new_disk 600M) || { fail "disk creation"; return; }
+    printf 'label: dos\nstart=2048, size=204800, type=83\nstart=206848, size=409600, type=5\nstart=208896, size=102400, type=83\nstart=313344, size=102400, type=83\nstart=417792, size=102400, type=83\n' |
+        sfdisk -q "$d" >/dev/null 2>&1
+    reread_table "$d" >/dev/null 2>&1
+    wait_for_dev "$(part_dev "$d" 7)"
+    mkfs.ext4 -q -L SIX "$(part_dev "$d" 6)"
+    mkfs.ext4 -q -L SEVEN "$(part_dev "$d" 7)"
+    op_delete "$d" 5 1 >/dev/null 2>&1
+    dn=$(kname "$d")
+    check_eq "former partition 6 is now partition 5" SIX "$(fs_prop "$(part_dev "$d" 5)" LABEL)"
+    check_eq "former partition 7 is now partition 6" SEVEN "$(fs_prop "$(part_dev "$d" 6)" LABEL)"
+    check "no stale partition 7 left in the kernel" test ! -e "/sys/class/block/${dn}p7"
+    check "kernel and partition table agree" kernel_in_sync "$d"
+}
+
+# --- deleting partitions that are in use ------------------------------------------
+
+test_delete_in_use() {
+    echo "== Deleting partitions in use"
+    local d p idx
+    d=$(new_disk 256M) || { fail "disk creation"; return; }
+    run_input "label: gpt" sfdisk -q "$d" >/dev/null 2>&1
+    p=$(create_part "$d" 64 ext4)
+    mount "$p" "$WORK/m"
+    check "op_delete refuses a mounted partition" not op_delete "$d" "$(part_nr "$p")" 1 2>/dev/null
+    load_table "$d"
+    check_eq "the mounted partition is still in the table" 1 "${#T_NR[@]}"
+    # mounted twice: the wizard must unmount it everywhere before deleting
+    mkdir -p "$WORK/m2"
+    mount --bind "$WORK/m" "$WORK/m2"
+    idx=$(disk_index "$d")
+    printf '5\n%s\n1\n9\n' "$idx" | main_menu >"$WORK/flow-del.log" 2>&1
+    load_table "$d"
+    check_eq "wizard: partition mounted twice deleted" 0 "${#T_NR[@]}"
+    check "wizard: every mount point was unmounted" not findmnt -n "$WORK/m2"
+}
+
+# --- partition table backups ----------------------------------------------------------
+
+test_backups() {
+    echo "== Partition table backups"
+    local d n f other
+    d=$(new_disk 128M) || { fail "disk creation"; return; }
+    run_input "label: gpt" sfdisk -q "$d" >/dev/null 2>&1
+    n=$(compgen -G "$PW_BACKUP_DIR/$(kname "$d")-*" | wc -l)
+    backup_table "$d" 2>/dev/null
+    backup_table "$d" 2>/dev/null
+    backup_table "$d" 2>/dev/null
+    check_eq "backups taken in the same second do not overwrite each other" $(( n + 3 )) "$(compgen -G "$PW_BACKUP_DIR/$(kname "$d")-*" | wc -l)"
+    f=$(compgen -G "$PW_BACKUP_DIR/$(kname "$d")-*" | head -n1)
+    check_eq "no warning when restoring a backup on its own disk" "" "$(backup_id_warning "$f" "$d")"
+    other=$(new_disk 128M) || { fail "disk creation"; return; }
+    run_input "label: gpt" sfdisk -q "$other" >/dev/null 2>&1
+    check "warning when the backup comes from another disk" test -n "$(backup_id_warning "$f" "$other")"
+}
+
+# --- disks without a supported partition table -----------------------------------------
+
+test_signatures() {
+    echo "== Disks without a supported partition table"
+    local d rc
+    d=$(new_disk 128M) || { fail "disk creation"; return; }
+    mkfs.ext4 -q "$d"
+    load_table "$d"
+    rc=$?
+    check_eq "whole-disk file system: no partition table" 1 "$rc"
+    check_eq "whole-disk file system signature detected" ext4 "$(dev_signatures "$d")"
+    run_input "label: sun" sfdisk -q "$d" >/dev/null 2>&1
+    load_table "$d"
+    rc=$?
+    check_eq "unsupported partition table type detected" 2 "$rc"
+}
+
+# --- NTFS and FAT ----------------------------------------------------------------------
+
+test_ntfs() {
+    echo "== NTFS"
+    local d p nr
+    if ! command -v mkfs.ntfs >/dev/null || ! command -v ntfsresize >/dev/null; then skip "NTFS tools not installed"; return; fi
+    d=$(new_disk 512M) || { fail "disk creation"; return; }
+    run_input "label: gpt" sfdisk -q "$d" >/dev/null 2>&1
+    p=$(create_part "$d" 100 ntfs WINDATA)
+    check_eq "NTFS created" "ntfs WINDATA" "$(fs_type "$p") $(fs_prop "$p" LABEL)"
+    check_eq "Microsoft basic data partition type" "$GPT_MSDATA" "$(sfdisk --part-type "$d" "$(part_nr "$p")" 2>/dev/null)"
+    nr=$(part_nr "$p")
+    set_part_end "$d" "$nr" "$(end_for_size "$d" "$nr" 200)" >/dev/null 2>&1 && grow_contents "$p" >/dev/null 2>&1
+    check "NTFS grown" test "$(ntfsresize -f -i "$p" 2>/dev/null | awk '/Current volume size/ { print $4 }')" -gt "$(mib 199)"
+    op_shrink "$d" "$nr" "$(end_for_size "$d" "$nr" 80)" >/dev/null 2>&1
+    check_eq "NTFS partition shrunk" "$(mib 80)" "$(dev_bytes "$p")"
+    check "NTFS file system fits the partition" test "$(ntfsresize -f -i "$p" 2>/dev/null | awk '/Current volume size/ { print $4 }')" -le "$(mib 80)"
+}
+
+test_vfat() {
+    echo "== FAT"
+    local d p
+    if ! command -v mkfs.vfat >/dev/null; then skip "dosfstools not installed"; return; fi
+    d=$(new_disk 256M) || { fail "disk creation"; return; }
+    run_input "label: gpt" sfdisk -q "$d" >/dev/null 2>&1
+    p=$(create_part "$d" 128 vfat EFI)
+    check_eq "128 MiB partition formatted as FAT32" "vfat FAT32 EFI" "$(fs_type "$p") $(fs_prop "$p" VERSION) $(fs_prop "$p" LABEL)"
+    p=$(create_part "$d" 16 vfat SMALL)
+    check "16 MiB partition formatted as FAT12/FAT16" test "$(fs_prop "$p" VERSION)" != FAT32
+}
+
+# --- LUKS ------------------------------------------------------------------------------
+
+test_luks() {
+    echo "== LUKS"
+    local d p nr before
+    if ! command -v cryptsetup >/dev/null || ! dmsetup version >/dev/null 2>&1; then
+        skip "cryptsetup/device-mapper not available"
+        return
+    fi
+    d=$(new_disk 512M) || { fail "disk creation"; return; }
+    run_input "label: gpt" sfdisk -q "$d" >/dev/null 2>&1
+    p=$(create_part "$d" 128 none)
+    printf 'pw-test-secret' | cryptsetup luksFormat -q --type luks2 --pbkdf pbkdf2 --pbkdf-force-iterations 1000 "$p" - >/dev/null 2>&1
+    printf 'pw-test-secret' | cryptsetup open --key-file - "$p" pwtestcrypt >/dev/null 2>&1
+    if [[ ! -e /dev/mapper/pwtestcrypt ]]; then
+        skip "could not open the test LUKS volume"
+        return
+    fi
+    mkfs.ext4 -q /dev/mapper/pwtestcrypt
+    before=$(dev_bytes /dev/mapper/pwtestcrypt)
+    nr=$(part_nr "$p")
+    set_part_end "$d" "$nr" "$(end_for_size "$d" "$nr" 256)" >/dev/null 2>&1
+    # cryptsetup may ask for the passphrase to resize a LUKS2 volume
+    grow_contents "$p" >/dev/null 2>&1 <<<"pw-test-secret"
+    # the partition grew by 128 MiB, so the mapping must grow by the same amount
+    # (the LUKS header size does not change)
+    check_eq "LUKS mapping grown by 128 MiB" $(( before + $(mib 128) )) "$(dev_bytes /dev/mapper/pwtestcrypt)"
+    check "file system inside LUKS grown" test "$(ext_bytes /dev/mapper/pwtestcrypt)" -gt "$before"
+    check "file system fills the LUKS mapping" fills "$(dev_bytes /dev/mapper/pwtestcrypt)" "$(ext_bytes /dev/mapper/pwtestcrypt)"
+    cryptsetup close pwtestcrypt
+}
+
 # --- LVM ---------------------------------------------------------------------------------
 
 test_lvm() {
@@ -462,12 +613,13 @@ EOF
 2
 $idx
 1
-max
+
 9
 EOF
     PW_DRY_RUN=0
     check_eq "wizard: dry run changes nothing" "$(mib 80)" "$(dev_bytes "$p")"
     check "wizard: dry run shows the commands" grep -q 'dry-run.*sfdisk' "$WORK/flow4.log"
+    check "wizard: an empty answer selects the default size (max)" grep -q "dry-run.*echo ', [0-9]*' | sfdisk" "$WORK/flow4.log"
 
     # Delete a mounted partition (it is unmounted after the confirmation)
     mount "$p" "$WORK/m"
@@ -482,6 +634,17 @@ EOF
     check "wizard: partition unmounted before deletion" not findmnt -n "$WORK/m"
 }
 
+# --- command line -----------------------------------------------------------------------
+
+test_cli() {
+    echo "== Command line"
+    local out
+    out=$(PW_LOG_FILE="$WORK/cli.log" "$SCRIPT" --list --include-loop 2>/dev/null)
+    check "--list writes to standard output" grep -q "Disks and partitions" <<<"$out"
+    check "--version" grep -q "^partition-wizard [0-9]" <<<"$("$SCRIPT" --version)"
+    check "unknown options are rejected" not "$SCRIPT" --no-such-option 2>/dev/null
+}
+
 # --- run ---------------------------------------------------------------------------------
 
 mkdir -p "$WORK/m"
@@ -494,8 +657,16 @@ test_mbr_logical
 test_swap
 test_xfs
 test_btrfs
+test_mbr_logical_delete
+test_delete_in_use
+test_backups
+test_signatures
+test_ntfs
+test_vfat
+test_luks
 test_lvm
 test_wizard_flows
+test_cli
 
 echo
 printf 'Result: %d passed, %d failed, %d skipped\n' "$PASS" "$FAIL" "$SKIP"
