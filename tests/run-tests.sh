@@ -22,7 +22,6 @@ if (( EUID != 0 )); then
 fi
 
 WORK=$(mktemp -d /tmp/pw-tests.XXXXXX)
-LOOPS=()
 PASS=0
 FAIL=0
 SKIP=0
@@ -42,7 +41,7 @@ PW_INCLUDE_LOOP=1
 ui_init
 
 cleanup_tests() {
-    local l m
+    local l f m
     for m in $(findmnt -rn -o TARGET | grep -E "^($WORK|/tmp/partition-wizard\.)" | sort -r); do
         umount "$m" 2>/dev/null
     done
@@ -51,10 +50,13 @@ cleanup_tests() {
         vgremove -f pwtestvg >/dev/null 2>&1
     fi
     [[ -e /dev/mapper/pwtestcrypt ]] && cryptsetup close pwtestcrypt 2>/dev/null
-    for l in "${LOOPS[@]}"; do
-        swapoff "$l"* 2>/dev/null
+    # new_disk runs in a subshell, so the loop devices are found through
+    # their backing files
+    while read -r l f; do
+        [[ $f == "$WORK"/* ]] || continue
+        swapoff "$l"p* 2>/dev/null
         losetup -d "$l" 2>/dev/null
-    done
+    done < <(losetup -nO NAME,BACK-FILE 2>/dev/null)
     rm -rf "$WORK"
 }
 trap cleanup_tests EXIT
@@ -87,7 +89,6 @@ new_disk() {   # size -> prints the loop device
     img=$(mktemp "$WORK/disk.XXXXXX.img")
     truncate -s "$1" "$img"
     l=$(losetup -fP --show "$img") || return 1
-    LOOPS+=("$l")
     printf '%s\n' "$l"
 }
 
