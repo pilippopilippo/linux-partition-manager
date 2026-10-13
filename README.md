@@ -1,155 +1,167 @@
 # Linux Partition Manager
 
-**Partition Wizard** è uno script Bash con un'interfaccia guidata (wizard) per
-**espandere e modificare le partizioni dei dischi** su Linux. Funziona sulle
-distribuzioni basate su **Debian** (Debian, Ubuntu, Linux Mint, Pop!_OS, ...) e
-su quelle basate su **Fedora** (Fedora, RHEL, CentOS Stream, Rocky, AlmaLinux, ...).
+**Partition Wizard** is a Bash script with a guided interface (wizard) to
+**grow and modify disk partitions** on Linux. It works on **Debian-based**
+distributions (Debian, Ubuntu, Linux Mint, Pop!_OS, ...) and on
+**Fedora-based** ones (Fedora, RHEL, CentOS Stream, Rocky, AlmaLinux, ...).
 
-La distribuzione viene riconosciuta automaticamente; puoi anche sceglierla tu
-con `--distro debian` oppure `--distro fedora`. Gli strumenti che mancano vengono
-installati con il gestore di pacchetti giusto (`apt` oppure `dnf`), solo dopo la
-tua conferma.
+The distribution is detected automatically; you can also choose it yourself
+with `--distro debian` or `--distro fedora`. Missing tools are installed with
+the right package manager (`apt` or `dnf`), only after you confirm.
 
-## Avvio rapido
+## Quick start
 
-Esegui lo script direttamente da GitHub:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/pilippopilippo/linux-partition-manager/main/partition-wizard.sh | sudo bash
-```
-
-Sui sistemi senza `curl` (ad esempio Debian minimale) puoi usare `wget`:
+Run the script straight from GitHub:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/pilippopilippo/linux-partition-manager/main/partition-wizard.sh | sudo bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/pilippopilippo/linux-partition-manager/main/partition-wizard.sh)"
 ```
 
-Per **provare senza modificare nulla** (modalità simulazione: i comandi vengono
-solo mostrati):
+On systems without `curl` (for example a minimal Debian) use `wget`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/pilippopilippo/linux-partition-manager/main/partition-wizard.sh | sudo bash -s -- --dry-run
+sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/pilippopilippo/linux-partition-manager/main/partition-wizard.sh)"
 ```
 
-Puoi anche scaricarlo e poi eseguirlo, oppure installarlo come comando:
+To **try it without changing anything** (dry-run mode: commands are only
+shown), add `partition-wizard --dry-run` at the end:
+
+```bash
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/pilippopilippo/linux-partition-manager/main/partition-wizard.sh)" partition-wizard --dry-run
+```
+
+You can also download it first, or install it as a command:
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/pilippopilippo/linux-partition-manager/main/partition-wizard.sh
 chmod +x partition-wizard.sh
 sudo ./partition-wizard.sh
 
-# oppure, per averlo sempre disponibile come "partition-wizard":
+# or, to always have it available as "partition-wizard":
 sudo curl -fsSL -o /usr/local/bin/partition-wizard https://raw.githubusercontent.com/pilippopilippo/linux-partition-manager/main/partition-wizard.sh
 sudo chmod +x /usr/local/bin/partition-wizard
 ```
 
-## Cosa fa
+> **Why not `curl ... | sudo bash`?** On Debian 13, Ubuntu 24.04 and other
+> recent systems sudo runs commands in a separate pseudo-terminal (`use_pty`)
+> and does not forward the keyboard to a script that arrives through a pipe:
+> the wizard would show its first window but never react to keys. The script
+> detects this case and prints the command to use instead.
 
-Il menu principale offre:
+## What it does
 
-| Voce | Descrizione |
+The main menu offers:
+
+| Item | Description |
 |------|-------------|
-| **Visualizza dischi, partizioni e spazio libero** | Albero dei dischi, spazio non allocato, gruppi di volumi LVM. |
-| **Espandi una partizione** | Ingrandisce la partizione nello spazio libero che la segue e poi ne espande il contenuto: volume cifrato LUKS → volume fisico LVM → file system. Funziona anche sulla partizione di sistema in uso. |
-| **Riduci una partizione** | Riduce prima il file system e poi la partizione, liberando spazio non allocato. |
-| **Crea una nuova partizione** | Crea la tabella delle partizioni (GPT o MBR) se manca, crea la partizione nello spazio libero, la formatta e, se vuoi, la monta e la aggiunge a `/etc/fstab`. |
-| **Elimina una partizione** | Elimina una partizione (con conferma digitandone il nome) e commenta le righe di `/etc/fstab` e `/etc/crypttab` che la citano. |
-| **Gestisci LVM** | Espande un volume logico usando lo spazio libero del gruppo, oppure aggiunge una partizione a un gruppo di volumi. |
-| **Rileva il nuovo spazio di un disco ingrandito** | Dopo aver ingrandito un disco virtuale: rilegge la dimensione del disco e, se serve, estende la tabella GPT fino alla fine del disco. |
-| **Ripristina una tabella delle partizioni da backup** | Ripristina uno dei backup salvati automaticamente prima di ogni modifica. |
+| **Show disks, partitions and free space** | Disk tree, unallocated space, LVM volume groups. |
+| **Grow a partition** | Grows the partition into the free space that follows it, then grows its contents: LUKS encrypted volume -> LVM physical volume -> file system. Also works on the running system's own partition. |
+| **Shrink a partition** | Shrinks the file system first and then the partition, leaving unallocated space. |
+| **Create a new partition** | Creates the partition table (GPT or MBR) if missing, creates the partition in free space, formats it and, if you want, mounts it and adds it to `/etc/fstab`. |
+| **Delete a partition** | Deletes a partition (you confirm by typing its name) and comments out the `/etc/fstab` and `/etc/crypttab` lines that refer to it. |
+| **Manage LVM** | Extends a logical volume using the free space of its group, or adds a partition to a volume group. |
+| **Detect new space on an enlarged disk** | After enlarging a virtual disk: re-reads the disk size and, if needed, extends the GPT to the end of the disk. |
+| **Restore a partition table from a backup** | Restores one of the backups saved automatically before every change. |
 
-### File system supportati
+### Supported file systems
 
-| Contenuto | Espansione | Riduzione | Creazione |
-|-----------|------------|-----------|-----------|
-| ext2 / ext3 / ext4 | ✅ anche montato | ✅ da smontato | ✅ (ext4) |
-| XFS | ✅ anche montato | ❌ XFS non si può ridurre | ✅ |
-| Btrfs | ✅ anche montato | ✅ anche montato | ✅ |
-| NTFS | ✅ da smontato | ✅ da smontato | ✅ |
-| FAT32 | ❌ | ❌ | ✅ |
-| swap | ✅ (UUID conservato) | ✅ (UUID conservato) | ✅ |
-| LVM (volume fisico) | ✅ `pvresize` + espansione del volume logico | ❌ | ✅ |
-| LUKS (volume cifrato aperto) | ✅ `cryptsetup resize` + contenuto | ❌ | ❌ |
+| Contents | Grow | Shrink | Create |
+|----------|------|--------|--------|
+| ext2 / ext3 / ext4 | yes, even mounted | yes, unmounted | yes (ext4) |
+| XFS | yes, even mounted | no (XFS cannot shrink) | yes |
+| Btrfs | yes, even mounted | yes, even mounted | yes |
+| NTFS | yes, unmounted | yes, unmounted | yes |
+| FAT32 | no | no | yes |
+| swap | yes (UUID kept) | yes (UUID kept) | yes |
+| LVM physical volume | yes: `pvresize` + logical volume extension | no | yes |
+| LUKS (open encrypted volume) | yes: `cryptsetup resize` + contents | no | no |
 
-Tabelle delle partizioni: **GPT** e **MBR/DOS** (comprese le partizioni logiche
-dentro una partizione estesa, che viene ingrandita automaticamente quando serve).
+Partition tables: **GPT** and **MBR/DOS**, including logical partitions inside
+an extended partition (the extended partition is grown automatically when
+needed).
 
-## Esempi di utilizzo
+## Examples
 
-**Ho ingrandito il disco della macchina virtuale e voglio usare il nuovo spazio**
-1. *Espandi una partizione* → scegli il disco. Lo script rileva la nuova dimensione
-   e propone di estendere la tabella GPT.
-2. Scegli la partizione (di solito l'ultima, ad esempio la radice `/`) e premi Invio su `max`.
-3. Partizione e file system vengono espansi a caldo, senza riavviare.
+**I enlarged my virtual machine's disk and want to use the new space**
+1. *Grow a partition* -> pick the disk. The script detects the new size and
+   offers to extend the GPT.
+2. Pick the partition (usually the last one, e.g. the root `/`) and press
+   Enter on `max`.
+3. Partition and file system are grown online, no reboot needed.
 
-**Ubuntu con LVM: il volume logico non usa tutto lo spazio del gruppo**
-*Gestisci LVM* → *Espandi un volume logico* → scegli `ubuntu-vg/ubuntu-lv` → `max`.
+**Ubuntu with LVM: the logical volume does not use the whole group**
+*Manage LVM* -> *Extend a logical volume* -> pick `ubuntu-vg/ubuntu-lv` -> `max`.
 
-**Aggiungere un disco dati**
-*Crea una nuova partizione* → scegli il disco nuovo → GPT → `max` → ext4 →
-etichetta → punto di montaggio (es. `/srv/dati`). La partizione viene montata e
-aggiunta a `/etc/fstab` con l'opzione `nofail`.
+**Adding a data disk**
+*Create a new partition* -> pick the new disk -> GPT -> `max` -> ext4 ->
+label -> mount point (e.g. `/srv/data`). The partition is mounted and added
+to `/etc/fstab` with the `nofail` option.
 
-**Fare spazio per una nuova partizione**
-*Riduci una partizione* → indica la nuova dimensione (es. `100G` oppure `-50G`),
-poi *Crea una nuova partizione* nello spazio liberato.
+**Making room for a new partition**
+*Shrink a partition* -> enter the new size (e.g. `100G` or `-50G`), then
+*Create a new partition* in the freed space.
 
-Le dimensioni si indicano con le unità `M`, `G`, `T` (multipli di 1024), anche
-con decimali: `500M`, `20G`, `1.5T`, `+10G` (aggiungi), `-5G` (togli), `max`
-(tutto lo spazio disponibile).
+Sizes use the units `M`, `G`, `T` (powers of 1024), decimals allowed:
+`500M`, `20G`, `1.5T`, `+10G` (add), `-5G` (remove), `max` (all the available
+space).
 
-## Sicurezza
+## Safety
 
-Modificare le partizioni è sempre un'operazione delicata: **fai un backup dei
-dati importanti prima di iniziare**. Lo script cerca comunque di ridurre i rischi:
+Changing partitions is always delicate: **back up your important data
+before starting**. The script still does its best to reduce the risks:
 
-- prima di ogni modifica salva la tabella delle partizioni in
-  `/var/backups/partition-wizard/`; si ripristina dal menu oppure con
-  `sudo sfdisk /dev/sdX < file-di-backup`;
-- registra ogni comando eseguito in `/var/log/partition-wizard.log`;
-- mostra un riepilogo e chiede conferma prima di ogni operazione; per eliminare
-  o sovrascrivere dati occorre digitare il nome del dispositivo;
-- durante le operazioni critiche `Ctrl+C` viene ignorato, per non lasciare
-  file system o tabelle a metà;
-- non elimina né smonta le partizioni di sistema (`/`, `/boot`, `/home`, ...);
-- con `--dry-run` puoi vedere esattamente quali comandi verrebbero eseguiti.
+- before every change it saves the partition table to
+  `/var/backups/partition-wizard/`; restore it from the menu or with
+  `sudo sfdisk /dev/sdX < backup-file`;
+- every command it runs is logged to `/var/log/partition-wizard.log`;
+- it shows a summary and asks for confirmation before every operation; to
+  delete or overwrite data you have to type the device name;
+- `Ctrl+C` is ignored during critical operations, so that file systems and
+  partition tables are never left half done;
+- it never deletes or unmounts system partitions (`/`, `/boot`, `/home`, ...);
+- with `--dry-run` you can see exactly which commands would be run;
+- all text is plain ASCII, so it renders correctly even on consoles without a
+  UTF-8 locale.
 
-### Limiti
+### Limitations
 
-- Una partizione può crescere solo nello spazio libero che si trova **subito dopo**
-  di essa: lo script non sposta le partizioni (per questo serve ad esempio GParted
-  da una live USB).
-- Ridurre un file system ext4 o NTFS richiede che sia smontato: per la partizione
-  di sistema avvia il computer da una live USB ed esegui lo script da lì.
-- XFS non può essere ridotto; la riduzione di volumi LVM e LUKS non è automatica.
+- A partition can only grow into the free space **right after** it: the
+  script does not move partitions (use for example GParted from a live USB
+  for that).
+- Shrinking an ext4 or NTFS file system requires it to be unmounted: for the
+  system partition, boot from a live USB and run the script from there.
+- XFS cannot be shrunk; shrinking LVM and LUKS volumes is not automated.
 
-## Opzioni
+## Options
 
 ```
-Uso: partition-wizard.sh [opzioni]
+Usage: partition-wizard.sh [options]
 
-  -n, --dry-run        simulazione: mostra i comandi senza modificare nulla
-  -t, --text           interfaccia testuale semplice (senza whiptail)
-  -d, --distro NOME    forza la famiglia di distribuzione: debian | fedora
-  -l, --list           mostra dischi, partizioni e spazio libero ed esce
-      --install-deps   installa tutti gli strumenti necessari ed esce
-  -y, --yes            installa le dipendenze senza chiedere conferma
-      --include-loop   mostra anche i dispositivi loop (prove su file immagine)
-  -h, --help           mostra questo aiuto
-  -V, --version        mostra la versione
+  -n, --dry-run        simulation: show the commands without changing anything
+  -t, --text           plain text interface (no whiptail)
+  -d, --distro NAME    force the distribution family: debian | fedora
+  -l, --list           show disks, partitions and free space, then exit
+      --install-deps   install all the required tools, then exit
+  -y, --yes            install dependencies without asking for confirmation
+      --include-loop   also show loop devices (for tests on image files)
+  -h, --help           show this help
+  -V, --version        show the version
 ```
 
-## Requisiti
+When the script is started with `bash -c "$(curl ...)"`, put the options
+after a name for the script, e.g. `... partition-wizard --text`.
 
-- Bash 4.2 o successivo e privilegi di root (lo script si riavvia con `sudo` se
-  serve).
-- Gli strumenti vengono installati automaticamente quando servono, oppure tutti
-  insieme con `sudo ./partition-wizard.sh --install-deps`:
+## Requirements
 
-| Funzione | Debian / Ubuntu | Fedora / RHEL |
-|----------|-----------------|---------------|
-| Tabelle delle partizioni (`sfdisk`, `partx`, `lsblk`, ...) | `fdisk`, `util-linux` | `util-linux` |
-| Interfaccia a finestre (`whiptail`) | `whiptail` | `newt` |
+- Bash 4.2 or newer and root privileges (the script restarts itself with
+  `sudo` when needed).
+- Tools are installed automatically when needed, or all at once with
+  `sudo ./partition-wizard.sh --install-deps`:
+
+| Feature | Debian / Ubuntu | Fedora / RHEL |
+|---------|-----------------|---------------|
+| Partition tables (`sfdisk`, `partx`, `lsblk`, ...) | `fdisk`, `util-linux` | `util-linux` |
+| Dialog interface (`whiptail`) | `whiptail` | `newt` |
 | ext2/3/4 | `e2fsprogs` | `e2fsprogs` |
 | XFS | `xfsprogs` | `xfsprogs` |
 | Btrfs | `btrfs-progs` | `btrfs-progs` |
@@ -158,32 +170,32 @@ Uso: partition-wizard.sh [opzioni]
 | FAT32 | `dosfstools` | `dosfstools` |
 | NTFS | `ntfs-3g` | `ntfsprogs` |
 
-Se `whiptail` non è disponibile (o con `--text`) il wizard usa una semplice
-interfaccia a menu numerati.
+If `whiptail` is not available (or with `--text`) the wizard uses a simple
+numbered-menu interface.
 
-## Sviluppo e test
+## Development and tests
 
-I test creano dischi virtuali (file immagine collegati a dispositivi loop) e
-verificano le operazioni reali su ext4, XFS, Btrfs, swap, LVM, GPT, MBR con
-partizioni logiche e i percorsi completi del wizard. Non toccano i dischi reali.
+The tests create virtual disks (image files attached to loop devices) and
+check the real operations on ext4, XFS, Btrfs, swap, LVM, GPT, MBR with
+logical partitions and complete wizard flows. They never touch real disks.
 
 ```bash
 sudo ./partition-wizard.sh --install-deps --yes
 sudo tests/run-tests.sh
 ```
 
-Puoi anche provare il wizard su un disco finto:
+You can also try the wizard on a fake disk:
 
 ```bash
-truncate -s 2G /tmp/disco.img
-sudo losetup -fP --show /tmp/disco.img     # es. /dev/loop0
+truncate -s 2G /tmp/disk.img
+sudo losetup -fP --show /tmp/disk.img     # e.g. /dev/loop0
 sudo ./partition-wizard.sh --include-loop
-sudo losetup -d /dev/loop0                 # al termine
+sudo losetup -d /dev/loop0                # when done
 ```
 
-La CI su GitHub Actions esegue ShellCheck, i test su Ubuntu e l'installazione
-delle dipendenze su Debian, Ubuntu, Fedora e Rocky Linux.
+GitHub Actions CI runs ShellCheck, the tests on Ubuntu and the dependency
+installation on Debian, Ubuntu, Fedora and Rocky Linux.
 
-## Licenza
+## License
 
 [MIT](LICENSE)

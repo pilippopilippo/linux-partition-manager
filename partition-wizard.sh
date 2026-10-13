@@ -2,64 +2,66 @@
 # =============================================================================
 #  partition-wizard.sh
 #
-#  Wizard interattivo per espandere e modificare le partizioni dei dischi su
-#  distribuzioni Linux basate su Debian (Debian, Ubuntu, Mint, ...) o su
-#  Fedora (Fedora, RHEL, CentOS Stream, Rocky, Alma, ...).
+#  Interactive wizard to grow and modify disk partitions on Debian-based
+#  (Debian, Ubuntu, Mint, ...) and Fedora-based (Fedora, RHEL, CentOS Stream,
+#  Rocky, Alma, ...) Linux distributions.
 #
-#  Esecuzione diretta da GitHub:
-#    curl -fsSL https://raw.githubusercontent.com/pilippopilippo/linux-partition-manager/main/partition-wizard.sh | sudo bash
+#  Run it straight from GitHub:
+#    sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/pilippopilippo/linux-partition-manager/main/partition-wizard.sh)"
 #
-#  Progetto: https://github.com/pilippopilippo/linux-partition-manager
-#  Licenza:  MIT
+#  Project: https://github.com/pilippopilippo/linux-partition-manager
+#  License: MIT
 # =============================================================================
 #
-# Tutto il codice è racchiuso in funzioni e `main` viene invocato sull'ultima
-# riga: in questo modo lo script funziona anche quando bash lo legge da una
-# pipe (curl ... | sudo bash).
+# All code lives in functions and `main` is invoked on the very last line, so
+# the script also works when bash reads it from a pipe.
+# User-facing text is plain ASCII on purpose: it must render correctly on
+# terminals and consoles that are not using a UTF-8 locale.
 
 set -o pipefail
 
-PW_VERSION="1.0.0"
+PW_VERSION="1.1.0"
 PW_REPO="pilippopilippo/linux-partition-manager"
 PW_RAW_URL="https://raw.githubusercontent.com/${PW_REPO}/main/partition-wizard.sh"
+PW_RUN_CMD="sudo bash -c \"\$(curl -fsSL $PW_RAW_URL)\""
 PW_SELF="${BASH_SOURCE[0]:-}"
 
-# Opzioni (impostate dalla riga di comando)
+# Options (set from the command line)
 PW_MODE="wizard"          # wizard | list | install-deps | help | version
-PW_DRY_RUN=0              # 1 = mostra i comandi senza eseguirli
-PW_ASSUME_YES=0           # 1 = risponde "sì" a tutte le domande (solo test automatici)
-PW_YES_DEPS=0             # 1 = installa le dipendenze senza chiedere
-PW_NO_TUI=0               # 1 = interfaccia testuale semplice anche se c'è whiptail
-PW_INCLUDE_LOOP=0         # 1 = mostra anche i dispositivi loop
-PW_DISTRO=""              # debian | fedora (vuoto = rilevamento automatico)
+PW_DRY_RUN=0              # 1 = show commands without running them
+PW_ASSUME_YES=0           # 1 = answer "yes" to every question (automated tests only)
+PW_YES_DEPS=0             # 1 = install dependencies without asking
+PW_NO_TUI=0               # 1 = plain text interface even if whiptail is available
+PW_INCLUDE_LOOP=0         # 1 = also list loop devices
+PW_DISTRO=""              # debian | fedora (empty = auto-detect)
 PW_LOG_FILE="${PW_LOG_FILE:-/var/log/partition-wizard.log}"
 PW_BACKUP_DIR="${PW_BACKUP_DIR:-/var/backups/partition-wizard}"
 
-# Stato interno
+# Internal state
 PW_ARGS=()
 PW_UI="text"
 PW_DISTRO_NAME=""
 PW_PKG_UPDATED=0
 PW_TMP_MOUNTS=()
 PW_LAST_MNT=""
-PW_FSCK_DONE=""           # ultimo dispositivo ext2/3/4 verificato con e2fsck
-PW_DISK_CHANGED=0         # 1 se prepare_disk_growth ha rilevato/modificato qualcosa
+PW_FSCK_DONE=""           # last ext2/3/4 device checked with e2fsck
+PW_DISK_CHANGED=0         # 1 if prepare_disk_growth detected or changed something
 SFDISK_OPTS=(--no-reread)
 
 MIB=1048576
 
-# Tipi di partizione GPT
+# GPT partition types
 GPT_LINUX="0FC63DAF-8483-4772-8E79-3D69D8477DE4"
 GPT_SWAP="0657FD6D-A4AB-43C4-84E5-0933C84B4F4F"
 GPT_LVM="E6D6D379-F507-44C2-A23C-238F2A3DF928"
 GPT_MSDATA="EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"
 
-# Comandi di base (sempre necessari) e opzionali (per i vari file system)
+# Core commands (always needed) and optional ones (per file system)
 PW_CORE_CMDS=(sfdisk partx lsblk blkid findmnt wipefs blockdev awk)
 PW_OPTIONAL_CMDS=(whiptail resize2fs xfs_growfs btrfs pvresize cryptsetup mkfs.vfat ntfsresize)
 
 # -----------------------------------------------------------------------------
-# Messaggi, registro ed esecuzione dei comandi
+# Messages, log and command execution
 # -----------------------------------------------------------------------------
 
 init_colors() {
@@ -72,30 +74,30 @@ init_colors() {
 
 log() {
     [[ -n $PW_LOG_FILE ]] || return 0
-    printf '%s [%d] %s\n' "$(date '+%F %T')" "$$" "$*" >>"$PW_LOG_FILE" 2>/dev/null || true
+    { printf '%s [%d] %s\n' "$(date '+%F %T')" "$$" "$*" >>"$PW_LOG_FILE"; } 2>/dev/null || true
 }
 
 info() { printf '%s==>%s %s\n' "$C_BLUE$C_BOLD" "$C_RESET" "$*" >&2; log "INFO  $*"; }
 ok() {
     if (( PW_DRY_RUN )); then
-        printf '%s ✔ %s %s (simulato)\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$*" >&2
+        printf '%s[OK]%s %s (simulated)\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$*" >&2
     else
-        printf '%s ✔ %s %s\n' "$C_GREEN$C_BOLD" "$C_RESET" "$*" >&2
+        printf '%s[OK]%s %s\n' "$C_GREEN$C_BOLD" "$C_RESET" "$*" >&2
     fi
     log "OK    $*"
 }
-warn() { printf '%sATTENZIONE:%s %s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$*" >&2; log "WARN  $*"; }
-err()  { printf '%sERRORE:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; log "ERROR $*"; }
+warn() { printf '%sWARNING:%s %s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$*" >&2; log "WARN  $*"; }
+err()  { printf '%sERROR:%s %s\n' "$C_RED$C_BOLD" "$C_RESET" "$*" >&2; log "ERROR $*"; }
 die()  { err "$*"; exit 1; }
 
-# Esegue un comando mostrandolo a schermo e registrandolo nel log.
-# In modalità simulazione (--dry-run) il comando viene solo mostrato.
+# Runs a command, printing it on screen and recording it in the log.
+# In dry-run mode the command is only printed.
 run() {
     local cmdline rc
     printf -v cmdline '%q ' "$@"
     cmdline=${cmdline% }
     if (( PW_DRY_RUN )); then
-        printf '%s[simulazione]%s %s\n' "$C_YELLOW" "$C_RESET" "$cmdline" >&2
+        printf '%s[dry-run]%s %s\n' "$C_YELLOW" "$C_RESET" "$cmdline" >&2
         log "DRY   $cmdline"
         return 0
     fi
@@ -107,18 +109,18 @@ run() {
     return "$rc"
 }
 
-# Come run, ma passa il primo argomento sullo standard input del comando.
+# Like run, but feeds the first argument to the command's standard input.
 run_input() {
     local input=$1 cmdline rc
     shift
     printf -v cmdline '%q ' "$@"
     if [[ $input == *$'\n'* ]]; then
-        cmdline="${cmdline% } <<< ($(wc -l <<<"$input") righe di input)"
+        cmdline="${cmdline% } <<< ($(wc -l <<<"$input") lines of input)"
     else
         cmdline="echo '${input//\'/\'\\\'\'}' | ${cmdline% }"
     fi
     if (( PW_DRY_RUN )); then
-        printf '%s[simulazione]%s %s\n' "$C_YELLOW" "$C_RESET" "$cmdline" >&2
+        printf '%s[dry-run]%s %s\n' "$C_YELLOW" "$C_RESET" "$cmdline" >&2
         log "DRY   $cmdline"
         return 0
     fi
@@ -130,14 +132,14 @@ run_input() {
     return "$rc"
 }
 
-# Durante le operazioni critiche Ctrl+C viene ignorato (anche dai comandi
-# avviati), per non lasciare file system o tabelle a metà.
+# During critical operations Ctrl+C is ignored (also by the commands that are
+# started), so that file systems and partition tables are never left half done.
 critical_begin() { trap '' INT QUIT; }
 critical_end()   { trap on_interrupt INT QUIT; }
 
 on_interrupt() {
     printf '\n' >&2
-    warn "Interrotto dall'utente."
+    warn "Interrupted by the user."
     exit 130
 }
 
@@ -151,7 +153,7 @@ cleanup() {
 }
 
 # -----------------------------------------------------------------------------
-# Funzioni di utilità
+# Utilities
 # -----------------------------------------------------------------------------
 
 trim() {
@@ -161,8 +163,8 @@ trim() {
     printf '%s' "$s"
 }
 
-# Byte -> stringa leggibile (es. 21474836480 -> "20.00 GiB"), arrotondata per
-# difetto per non mostrare mai più spazio di quello realmente disponibile
+# Bytes -> human readable string (e.g. 21474836480 -> "20.00 GiB"), rounded
+# down so that it never shows more space than is really available
 human() {
     awk -v b="${1:-0}" 'BEGIN {
         split("B KiB MiB GiB TiB PiB", u, " "); i = 1
@@ -173,8 +175,8 @@ human() {
     }'
 }
 
-# Dimensione leggibile -> byte. Accetta K, M, G, T (multipli di 1024),
-# anche con decimali: 500M, 20G, 1.5T, 2,5G, 10GiB, 10GB.
+# Human readable size -> bytes. Accepts K, M, G, T (powers of 1024), also with
+# decimals: 500M, 20G, 1.5T, 2,5G, 10GiB, 10GB.
 parse_size() {
     local s num unit mult
     s=${1^^}
@@ -194,8 +196,8 @@ parse_size() {
 kname()     { basename "$(readlink -f "$1")"; }
 dev_bytes() { blockdev --getsize64 "$1" 2>/dev/null || echo 0; }
 
-# Tipo di contenuto di un dispositivo: ext4, xfs, btrfs, swap, crypto_LUKS,
-# LVM2_member, ntfs, vfat, ... (vuoto se non riconosciuto)
+# Content type of a device: ext4, xfs, btrfs, swap, crypto_LUKS, LVM2_member,
+# ntfs, vfat, ... (empty if not recognised)
 fs_type() {
     local t
     t=$(blkid -p -o value -s TYPE "$1" 2>/dev/null | head -n1)
@@ -220,7 +222,7 @@ swap_active() {
     return 1
 }
 
-# Dispositivi costruiti sopra DEV (LVM, LUKS, RAID ...)
+# Devices built on top of DEV (LVM, LUKS, RAID ...)
 dev_holders() {
     local h
     for h in /sys/class/block/"$(kname "$1")"/holders/*; do
@@ -228,7 +230,7 @@ dev_holders() {
     done
 }
 
-# Primo dispositivo "figlio" visibile da lsblk (es. /dev/mapper/vg-root)
+# First "child" device shown by lsblk (e.g. /dev/mapper/vg-root)
 dev_child() { lsblk -lnpo NAME "$1" 2>/dev/null | sed -n '2p'; }
 
 dev_in_use() {
@@ -247,14 +249,14 @@ disk_in_use() {
     return 1
 }
 
-# Numero di una partizione a partire dal suo dispositivo
+# Partition number of a partition device
 part_nr() {
     local f
     f="/sys/class/block/$(kname "$1")/partition"
     if [[ -r $f ]]; then cat "$f"; else printf '%s\n' "${1##*[!0-9]}"; fi
 }
 
-# Dispositivo della partizione NR del disco DISK (es. /dev/sda 2 -> /dev/sda2,
+# Device of partition NR on disk DISK (e.g. /dev/sda 2 -> /dev/sda2,
 # /dev/nvme0n1 2 -> /dev/nvme0n1p2)
 part_dev() {
     local disk=$1 nr=$2 dn p
@@ -278,7 +280,55 @@ wait_for_dev() {
 }
 
 # -----------------------------------------------------------------------------
-# Distribuzione e dipendenze
+# Terminal checks
+# -----------------------------------------------------------------------------
+
+# Fields of /proc/PID/stat after the command name: state ppid pgrp session tty_nr
+proc_field() {   # pid field_number
+    local stat rest f
+    stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    rest=${stat##*) }
+    read -r -a f <<<"$rest"
+    printf '%s\n' "${f[$2 - 1]}"
+}
+
+# True when keystrokes can never reach this script: it was piped into a sudo
+# that runs it in its own pseudo-terminal ("use_pty", the default on Debian 13
+# and Ubuntu 24.04). That sudo only forwards the keyboard when its own standard
+# input is a terminal, which is not the case with "curl ... | sudo bash".
+keyboard_unreachable() {
+    local mytty pid n comm fd0
+    mytty=$(proc_field $$ 5) || return 1
+    pid=$PPID
+    for (( n = 0; n < 16 && pid > 1; n++ )); do
+        if [[ $(proc_field "$pid" 5) != "$mytty" ]]; then
+            # first ancestor attached to a different terminal
+            comm=$(cat "/proc/$pid/comm" 2>/dev/null)
+            fd0=$(readlink "/proc/$pid/fd/0" 2>/dev/null)
+            [[ $comm == sudo && $fd0 != /dev/pts/* && $fd0 != /dev/tty* ]]
+            return
+        fi
+        pid=$(proc_field "$pid" 2) || return 1
+    done
+    return 1
+}
+
+pipe_hint() {
+    cat >&2 <<EOF
+
+The wizard cannot read the keyboard when it is piped into sudo:
+sudo runs it in a separate pseudo-terminal ("use_pty", the default on
+Debian 13 and Ubuntu 24.04) and does not forward keystrokes to it.
+
+Run it like this instead:
+
+  $PW_RUN_CMD
+
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Distribution and dependencies
 # -----------------------------------------------------------------------------
 
 detect_distro() {
@@ -305,7 +355,7 @@ detect_distro() {
     esac
 }
 
-# Pacchetto che fornisce un comando, per la famiglia di distribuzione corrente
+# Package providing a command, for the current distribution family
 pkg_for_cmd() {
     case "$PW_DISTRO:$1" in
         debian:sfdisk) echo fdisk ;;
@@ -344,14 +394,14 @@ install_pkgs() {
             fi
             ;;
         *)
-            err "Distribuzione non riconosciuta: installa manualmente i pacchetti: $*"
+            err "Unknown distribution: please install these packages manually: $*"
             return 1
             ;;
     esac
 }
 
-# Verifica che i comandi indicati siano presenti; se mancano propone di
-# installare i pacchetti corrispondenti. Restituisce 1 se qualcosa manca.
+# Checks that the given commands exist; offers to install the packages that
+# provide the missing ones. Returns 1 if something is still missing.
 ensure_cmds() {
     local c p missing=() pkgs=() unknown=()
     for c in "$@"; do
@@ -366,19 +416,19 @@ ensure_cmds() {
     (( ${#missing[@]} == 0 )) && return 0
 
     if (( ${#unknown[@]} )) || [[ -z $PW_DISTRO ]]; then
-        err "Comandi mancanti: ${missing[*]}. Installali manualmente e riprova."
+        err "Missing commands: ${missing[*]}. Please install them manually and try again."
         return 1
     fi
     if (( PW_DRY_RUN )); then
-        err "Comandi mancanti: ${missing[*]} (pacchetti: ${pkgs[*]}). In simulazione non installo nulla."
+        err "Missing commands: ${missing[*]} (packages: ${pkgs[*]}). Nothing is installed in dry-run mode."
         return 1
     fi
     if (( ! PW_YES_DEPS )); then
-        ui_yesno "Dipendenze mancanti" "Per continuare servono questi comandi: ${missing[*]}\n\nPacchetti da installare: ${pkgs[*]}\n\nVuoi installarli ora?" || return 1
+        ui_yesno "Missing dependencies" "These commands are needed to continue: ${missing[*]}\n\nPackages to install: ${pkgs[*]}\n\nInstall them now?" || return 1
     fi
-    install_pkgs "${pkgs[@]}" || { err "Installazione dei pacchetti non riuscita: ${pkgs[*]}"; return 1; }
+    install_pkgs "${pkgs[@]}" || { err "Package installation failed: ${pkgs[*]}"; return 1; }
     for c in "${missing[@]}"; do
-        command -v "$c" >/dev/null 2>&1 || { err "Il comando '$c' non è ancora disponibile."; return 1; }
+        command -v "$c" >/dev/null 2>&1 || { err "The command '$c' is still not available."; return 1; }
     done
     return 0
 }
@@ -391,15 +441,15 @@ install_all_deps() {
         [[ " ${pkgs[*]} " == *" $p "* ]] || pkgs+=("$p")
     done
     if (( ${#pkgs[@]} == 0 )); then
-        ok "Tutte le dipendenze sono già installate."
+        ok "All dependencies are already installed."
         return 0
     fi
-    info "Pacchetti da installare: ${pkgs[*]}"
+    info "Packages to install: ${pkgs[*]}"
     if (( ! PW_YES_DEPS )); then
-        ui_yesno "Dipendenze" "Verranno installati questi pacchetti:\n${pkgs[*]}\n\nProcedere?" || return 1
+        ui_yesno "Dependencies" "These packages will be installed:\n${pkgs[*]}\n\nContinue?" || return 1
     fi
     if ! install_pkgs "${pkgs[@]}"; then
-        warn "Installazione cumulativa non riuscita: provo un pacchetto alla volta."
+        warn "Installing all packages at once failed: trying one package at a time."
         for p in "${pkgs[@]}"; do
             install_pkgs "$p" || failed+=("$p")
         done
@@ -407,22 +457,22 @@ install_all_deps() {
     for c in "${PW_CORE_CMDS[@]}"; do
         command -v "$c" >/dev/null 2>&1 || core_missing+=("$c")
     done
-    (( ${#failed[@]} )) && warn "Pacchetti non installati (funzioni relative non disponibili): ${failed[*]}"
+    (( ${#failed[@]} )) && warn "Packages not installed (the related features are unavailable): ${failed[*]}"
     if (( ${#core_missing[@]} )); then
-        err "Mancano ancora comandi indispensabili: ${core_missing[*]}"
+        err "Essential commands are still missing: ${core_missing[*]}"
         return 1
     fi
-    ok "Dipendenze installate."
+    ok "Dependencies installed."
 }
 
-# Opzioni di sfdisk: la tabella viene scritta senza far rileggere l'intero
-# disco al kernel (che fallirebbe se il disco è in uso); il kernel viene poi
-# aggiornato partizione per partizione con partx.
+# sfdisk options: the table is written without asking the kernel to re-read
+# the whole disk (which fails when the disk is in use); the kernel is then
+# updated partition by partition with partx.
 init_sfdisk_opts() {
     local help
     help=$(LC_ALL=C sfdisk --help 2>/dev/null)
     if ! grep -q -- '--delete' <<<"$help"; then
-        err "La versione di sfdisk (util-linux) è troppo vecchia: serve util-linux 2.28 o successivo."
+        err "This sfdisk (util-linux) is too old: util-linux 2.28 or newer is required."
         return 1
     fi
     SFDISK_OPTS=(--no-reread)
@@ -431,7 +481,7 @@ init_sfdisk_opts() {
 }
 
 # -----------------------------------------------------------------------------
-# Interfaccia utente: whiptail se disponibile, altrimenti testo semplice
+# User interface: whiptail when available, plain text otherwise
 # -----------------------------------------------------------------------------
 
 ui_init() {
@@ -453,15 +503,15 @@ ui_size() {
     (( UI_HMAX < 10 )) && UI_HMAX=10
 }
 
-# Numero di righe occupate da un testo nella finestra
+# Number of lines a text takes inside the window
 ui_lines() {
     awk -v w=$(( UI_W - 4 )) '{ l = length($0); n += (l > w) ? int((l + w - 1) / w) : 1 } END { print n + 0 }' <<<"$1"
 }
 
-# Converte le sequenze "\n" in veri a capo
+# Turns "\n" sequences into real newlines
 ui_fmt() { printf '%s' "${1//\\n/$'\n'}"; }
 
-ui_header() { printf '\n%s━━━ %s ━━━%s\n' "$C_BOLD" "$1" "$C_RESET" >&2; }
+ui_header() { printf '\n%s=== %s ===%s\n' "$C_BOLD" "$1" "$C_RESET" >&2; }
 
 screen_start() {
     [[ $PW_UI == whiptail && -t 1 ]] && clear
@@ -471,12 +521,12 @@ screen_start() {
 pause() {
     (( PW_ASSUME_YES )) && return 0
     printf '\n' >&2
-    read -r -p "Premi Invio per ${1:-tornare al menu}... " _
+    read -r -p "Press Enter to ${1:-return to the menu}... " _
 }
 
-# Prima di aprire una finestra whiptail dopo l'output dei comandi, lascia il
-# tempo di leggerlo (whiptail ripulisce lo schermo).
-pause_if_tui() { [[ $PW_UI == whiptail ]] && pause "continuare"; return 0; }
+# Before opening a whiptail window after command output, give the user time
+# to read it (whiptail clears the screen).
+pause_if_tui() { [[ $PW_UI == whiptail ]] && pause "continue"; return 0; }
 
 ui_msg() {
     local title=$1 text h
@@ -492,18 +542,18 @@ ui_msg() {
     else
         ui_header "$title"
         printf '%s\n' "$text" >&2
-        (( PW_ASSUME_YES )) || read -r -p "Premi Invio per continuare... " _
+        (( PW_ASSUME_YES )) || read -r -p "Press Enter to continue... " _
     fi
     return 0
 }
 
-# ui_yesno TITOLO TESTO [si|no]  (terzo argomento: risposta predefinita)
+# ui_yesno TITLE TEXT [yes|no]  (third argument: default answer)
 ui_yesno() {
-    local title=$1 text def=${3:-si} h ans
+    local title=$1 text def=${3:-yes} h ans
     (( PW_ASSUME_YES )) && return 0
     text=$(ui_fmt "$2")
     if [[ $PW_UI == whiptail ]]; then
-        local args=(--title "$title" --yes-button "Sì" --no-button "No")
+        local args=(--title "$title" --yes-button "Yes" --no-button "No")
         [[ $def == no ]] && args+=(--defaultno)
         ui_size
         h=$(( $(ui_lines "$text") + 7 ))
@@ -514,17 +564,17 @@ ui_yesno() {
     ui_header "$title"
     printf '%s\n' "$text" >&2
     while :; do
-        if [[ $def == no ]]; then read -r -p "[s/N] " ans || return 1; else read -r -p "[S/n] " ans || return 1; fi
+        if [[ $def == no ]]; then read -r -p "[y/N] " ans || return 1; else read -r -p "[Y/n] " ans || return 1; fi
         ans=$(trim "${ans,,}")
         case $ans in
             "") [[ $def != no ]]; return ;;
-            s | si | sì | y | yes) return 0 ;;
+            y | yes) return 0 ;;
             n | no) return 1 ;;
         esac
     done
 }
 
-# ui_input TITOLO TESTO [VALORE_PREDEFINITO] -> stampa il valore inserito
+# ui_input TITLE TEXT [DEFAULT] -> prints the value entered
 ui_input() {
     local title=$1 text def=${3:-} h val
     text=$(ui_fmt "$2")
@@ -532,7 +582,7 @@ ui_input() {
         ui_size
         h=$(( $(ui_lines "$text") + 8 ))
         (( h > UI_HMAX )) && h=$UI_HMAX
-        whiptail --title "$title" --ok-button "OK" --cancel-button "Annulla" \
+        whiptail --title "$title" --ok-button "OK" --cancel-button "Cancel" \
             --inputbox "$text" "$h" "$UI_W" "$def" 3>&1 1>&2 2>&3
         return
     fi
@@ -542,9 +592,9 @@ ui_input() {
     printf '%s\n' "$val"
 }
 
-# ui_menu TITOLO TESTO tag1 voce1 [tag2 voce2 ...] -> stampa il tag scelto
-# Variabili facoltative: UI_CANCEL (testo del pulsante "Indietro"),
-# UI_NOTAGS=1 (non mostra i tag, solo le voci).
+# ui_menu TITLE TEXT tag1 item1 [tag2 item2 ...] -> prints the selected tag
+# Optional variables: UI_CANCEL (label of the "Back" button),
+# UI_NOTAGS=1 (show the items only, not the tags).
 ui_menu() {
     local title=$1 text n tl lh h ans i
     text=$(ui_fmt "$2")
@@ -560,7 +610,7 @@ ui_menu() {
         (( h > UI_HMAX )) && h=$UI_HMAX
         local wt_opts=()
         [[ -n ${UI_NOTAGS:-} ]] && wt_opts+=(--notags)
-        whiptail --title "$title" --ok-button "Seleziona" --cancel-button "${UI_CANCEL:-Indietro}" \
+        whiptail --title "$title" --ok-button "Select" --cancel-button "${UI_CANCEL:-Back}" \
             "${wt_opts[@]}" --menu "$text" "$h" "$UI_W" "$lh" "$@" 3>&1 1>&2 2>&3
         return
     fi
@@ -578,9 +628,9 @@ ui_menu() {
         shift 2
         i=$(( i + 1 ))
     done
-    printf '   0) %s\n' "${UI_CANCEL:-Indietro}" >&2
+    printf '   0) %s\n' "${UI_CANCEL:-Back}" >&2
     while :; do
-        read -r -p "Scelta: " ans || return 1
+        read -r -p "Choice: " ans || return 1
         ans=$(trim "$ans")
         [[ -z $ans || $ans == 0 ]] && return 1
         if [[ $ans =~ ^[0-9]+$ ]] && (( ans >= 1 && ans <= ${#tags[@]} )); then
@@ -590,23 +640,23 @@ ui_menu() {
     done
 }
 
-# Conferma rinforzata: l'utente deve digitare esattamente una parola.
+# Strong confirmation: the user must type an exact word.
 ui_confirm_typed() {
     local title=$1 text=$2 word=$3 ans
     (( PW_ASSUME_YES )) && return 0
-    ans=$(ui_input "$title" "$text\n\nPer confermare digita esattamente: $word") || return 1
+    ans=$(ui_input "$title" "$text\n\nTo confirm, type exactly: $word") || return 1
     [[ $(trim "$ans") == "$word" ]] && return 0
-    ui_msg "$title" "Il testo inserito non corrisponde: operazione annullata."
+    ui_msg "$title" "The text you typed does not match: operation cancelled."
     return 1
 }
 
 # -----------------------------------------------------------------------------
-# Lettura della tabella delle partizioni (tramite sfdisk --dump)
+# Reading the partition table (via sfdisk --dump)
 # -----------------------------------------------------------------------------
-# Dopo load_table DISCO sono disponibili:
-#   T_LABEL  gpt | dos        T_SS     dimensione del settore logico (byte)
-#   T_TOTAL  settori totali   T_FIRST/T_LAST primo/ultimo settore utilizzabile
-#   T_NR[] T_START[] T_SIZE[] T_TYPE[]  partizioni (settori logici)
+# After load_table DISK the following are available:
+#   T_LABEL  gpt | dos      T_SS     logical sector size (bytes)
+#   T_TOTAL  total sectors  T_FIRST/T_LAST first/last usable sector
+#   T_NR[] T_START[] T_SIZE[] T_TYPE[]  partitions (logical sectors)
 
 load_table() {
     local disk=$1 dump line
@@ -635,7 +685,7 @@ load_table() {
         dos)
             T_FIRST=1
             T_LAST=$(( T_TOTAL - 1 ))
-            # MBR: settori indirizzabili con 32 bit (2 TiB con settori da 512 byte)
+            # MBR: sectors are addressed with 32 bits (2 TiB with 512-byte sectors)
             (( T_LAST > 4294967295 )) && T_LAST=4294967295
             ;;
         gpt)
@@ -663,7 +713,7 @@ is_extended_type() {
 
 is_extended_idx() { [[ $T_LABEL == dos ]] && is_extended_type "${T_TYPE[$1]}"; }
 
-# Ultimo settore che la partizione NR può raggiungere senza spostare le altre
+# Last sector partition NR can reach without moving the other partitions
 part_max_end() {
     local nr=$1 i j start limit e align
     i=$(tbl_idx "$nr") || return 1
@@ -674,7 +724,7 @@ part_max_end() {
         (( j == i )) && continue
         (( T_START[j] > start )) || continue
         if [[ $T_LABEL == dos ]] && (( nr >= 5 )) && (( T_NR[j] >= 5 )); then
-            # partizione logica successiva: lascia spazio per il suo EBR
+            # next logical partition: leave room for its EBR
             e=$(( T_START[j] - align - 1 ))
         else
             e=$(( T_START[j] - 1 ))
@@ -684,8 +734,8 @@ part_max_end() {
     printf '%s\n' "$limit"
 }
 
-# Regioni di spazio non allocato (>= 1 MiB, inizio allineato a 1 MiB) in cui
-# è possibile creare una partizione primaria/GPT. Stampa "inizio fine".
+# Unallocated regions (>= 1 MiB, start aligned to 1 MiB) where a primary/GPT
+# partition can be created. Prints "start end".
 free_regions() {
     local i s e pos align lines=()
     align=$(( MIB / T_SS ))
@@ -708,8 +758,8 @@ _emit_gap() {
     return 0
 }
 
-# Spazio (byte) oltre la fine della tabella GPT: diverso da zero dopo aver
-# ingrandito un disco virtuale finché l'intestazione di backup non viene spostata.
+# Space (bytes) beyond the end of the GPT: non-zero after a virtual disk has
+# been enlarged, until the backup header is moved to the new end.
 gpt_tail_gap() {
     local entries std_last
     [[ $T_LABEL == gpt ]] || { echo 0; return; }
@@ -718,7 +768,7 @@ gpt_tail_gap() {
     if (( std_last > T_LAST )); then echo $(( (std_last - T_LAST) * T_SS )); else echo 0; fi
 }
 
-# Primo numero di partizione libero (per prevedere il nome in simulazione)
+# First free partition number (to predict the device name in dry-run mode)
 first_free_nr() {
     local n max=128
     [[ $T_LABEL == dos ]] && max=4
@@ -748,7 +798,7 @@ ptype_code() {
 }
 
 # -----------------------------------------------------------------------------
-# Elenchi e descrizioni di dischi e partizioni
+# Disk and partition lists and descriptions
 # -----------------------------------------------------------------------------
 
 list_disks() {
@@ -773,7 +823,7 @@ disk_desc() {
     case $pt in
         gpt) pt="GPT" ;;
         dos) pt="MBR" ;;
-        "") pt=$(fs_type "$d"); pt=${pt:+contiene $pt}; pt=${pt:-nessuna tabella} ;;
+        "") pt=$(fs_type "$d"); pt=${pt:+contains $pt}; pt=${pt:-no table} ;;
     esac
     nparts=$(lsblk -lno TYPE "$d" 2>/dev/null | grep -c '^part$')
     printf '%10s  %-16s %2s part.  %s' "$(human "$(dev_bytes "$d")")" "$pt" "$nparts" "$model"
@@ -783,7 +833,7 @@ select_disk() {
     local title=$1 text=$2 d disks=() items=()
     mapfile -t disks < <(list_disks)
     if (( ${#disks[@]} == 0 )); then
-        ui_msg "$title" "Nessun disco disponibile."
+        ui_msg "$title" "No disks available."
         return 1
     fi
     for d in "${disks[@]}"; do
@@ -792,29 +842,29 @@ select_disk() {
     ui_menu "$title" "$text" "${items[@]}"
 }
 
-# Descrizione della partizione all'indice I della tabella caricata
+# Description of the partition at index I of the loaded table
 part_desc() {
     local dev=$1 i=$2 size t label where
     size=$(human $(( T_SIZE[i] * T_SS )))
     if is_extended_idx "$i"; then
-        printf '%10s  partizione estesa (contiene le logiche)' "$size"
+        printf '%10s  extended partition (holds the logical ones)' "$size"
         return
     fi
     t=$(fs_type "$dev")
     label=$(fs_prop "$dev" LABEL)
     where=$(mountpoint_of "$dev")
-    swap_active "$dev" && where="[swap attiva]"
+    swap_active "$dev" && where="[active swap]"
     if [[ -z $where && -n $(dev_holders "$dev") ]]; then
-        where="→ $(dev_child "$dev")"
+        where="-> $(dev_child "$dev")"
     fi
     printf '%10s  %-12s %-14s %s' "$size" "${t:--}" "${label:+[$label]}" "$where"
 }
 
-# select_partition DISCO TITOLO TESTO [1 = includi le partizioni estese]
+# select_partition DISK TITLE TEXT [1 = include extended partitions]
 select_partition() {
     local disk=$1 title=$2 text=$3 with_ext=${4:-0} i dev items=()
     if ! load_table "$disk"; then
-        ui_msg "$title" "Il disco $disk non contiene una tabella delle partizioni."
+        ui_msg "$title" "Disk $disk has no partition table."
         return 1
     fi
     for i in "${!T_NR[@]}"; do
@@ -825,7 +875,7 @@ select_partition() {
         items+=("$dev" "$(part_desc "$dev" "$i")")
     done
     if (( ${#items[@]} == 0 )); then
-        ui_msg "$title" "Nessuna partizione trovata su $disk."
+        ui_msg "$title" "No partitions found on $disk."
         return 1
     fi
     ui_menu "$title" "$text" "${items[@]}"
@@ -837,28 +887,28 @@ show_disk() {
 }
 
 # -----------------------------------------------------------------------------
-# Operazioni di basso livello
+# Low-level operations
 # -----------------------------------------------------------------------------
 
 backup_table() {
     local disk=$1 f
     f="$PW_BACKUP_DIR/$(kname "$disk")-$(date +%Y%m%d-%H%M%S).sfdisk"
     if (( PW_DRY_RUN )); then
-        printf '%s[simulazione]%s backup della tabella in %s\n' "$C_YELLOW" "$C_RESET" "$f" >&2
+        printf '%s[dry-run]%s partition table backup to %s\n' "$C_YELLOW" "$C_RESET" "$f" >&2
         return 0
     fi
     if mkdir -p "$PW_BACKUP_DIR" && sfdisk --dump "$disk" >"$f" 2>/dev/null; then
-        info "Backup della tabella delle partizioni: $f"
-        info "Per ripristinarlo: sfdisk $disk < $f"
+        info "Partition table backup: $f"
+        info "To restore it: sfdisk $disk < $f"
         log "BACKUP $disk -> $f"
     else
         rm -f "$f"
-        warn "Impossibile salvare il backup della tabella delle partizioni di $disk."
+        warn "Could not save a backup of the partition table of $disk."
     fi
     return 0
 }
 
-# Comunica al kernel le modifiche alla tabella delle partizioni
+# Tells the kernel about partition table changes
 reread_table() {
     local disk=$1
     (( PW_DRY_RUN )) && return 0
@@ -894,14 +944,14 @@ fix_gpt() {
     elif ensure_cmds sgdisk && run sgdisk -e "$disk"; then
         :
     else
-        err "Impossibile spostare l'intestazione GPT di backup di $disk."
+        err "Could not move the backup GPT header of $disk."
         return 1
     fi
     reread_table "$disk"
-    ok "Tabella GPT estesa fino alla fine del disco."
+    ok "GPT now extends to the end of the disk."
 }
 
-# Rileva un eventuale ingrandimento del disco e corregge la GPT se necessario
+# Detects a disk that has been enlarged and fixes the GPT if needed
 prepare_disk_growth() {
     local disk=$1 before after gap
     PW_DISK_CHANGED=0
@@ -909,13 +959,13 @@ prepare_disk_growth() {
     rescan_disk "$disk"
     after=$(dev_bytes "$disk")
     if (( after != before )); then
-        info "Nuova dimensione rilevata per $disk: $(human "$before") → $(human "$after")"
+        info "New size detected for $disk: $(human "$before") -> $(human "$after")"
         PW_DISK_CHANGED=1
     fi
     load_table "$disk" || return 0
     gap=$(gpt_tail_gap)
     if (( gap >= MIB )); then
-        if ui_yesno "Tabella GPT da estendere" "La tabella GPT di $disk non copre tutto il disco: $(human "$gap") alla fine non sono utilizzabili.\n\nSuccede normalmente dopo aver ingrandito un disco virtuale. Vuoi spostare l'intestazione GPT di backup alla fine del disco per rendere disponibile questo spazio?\n\n(L'operazione è sicura e non modifica le partizioni esistenti.)"; then
+        if ui_yesno "Extend GPT" "The GPT of $disk does not cover the whole disk: $(human "$gap") at the end cannot be used.\n\nThis is normal after enlarging a virtual disk. Move the backup GPT header to the end of the disk to make this space available?\n\n(This is safe and does not change the existing partitions.)"; then
             fix_gpt "$disk"
             load_table "$disk"
             PW_DISK_CHANGED=1
@@ -924,13 +974,13 @@ prepare_disk_growth() {
     return 0
 }
 
-# Imposta il settore finale della partizione NR (ingrandimento o riduzione).
-# Restituisce 2 se la tabella è stata scritta ma il kernel usa ancora la
-# vecchia dimensione (serve un riavvio).
+# Sets the end sector of partition NR (grow or shrink).
+# Returns 2 if the table was written but the kernel still uses the old size
+# (a reboot is needed).
 set_part_end() {
     local disk=$1 nr=$2 new_end=$3 i j start ext_end part expected actual
     load_table "$disk" || return 1
-    i=$(tbl_idx "$nr") || { err "Partizione $nr non trovata su $disk."; return 1; }
+    i=$(tbl_idx "$nr") || { err "Partition $nr not found on $disk."; return 1; }
     start=${T_START[i]}
     backup_table "$disk"
     if [[ $T_LABEL == dos ]] && (( nr >= 5 )); then
@@ -938,7 +988,7 @@ set_part_end() {
             is_extended_idx "$j" || continue
             ext_end=$(( T_START[j] + T_SIZE[j] - 1 ))
             if (( new_end > ext_end )); then
-                info "Ingrandisco prima la partizione estesa n. ${T_NR[j]} che contiene la partizione logica."
+                info "Growing extended partition ${T_NR[j]} first, since it holds the logical partition."
                 run_input ", $(( new_end - T_START[j] + 1 ))" sfdisk "${SFDISK_OPTS[@]}" -N "${T_NR[j]}" "$disk" || return 1
             fi
         done
@@ -950,11 +1000,11 @@ set_part_end() {
     expected=$(( (new_end - start + 1) * T_SS ))
     actual=$(dev_bytes "$part")
     if (( actual != expected )); then
-        warn "La tabella è aggiornata, ma il kernel vede ancora $part con la vecchia dimensione ($(human "$actual"))."
-        warn "Riavvia il sistema e poi esegui di nuovo \"Espandi\" sulla stessa partizione per completare l'operazione."
+        warn "The table was updated, but the kernel still sees $part with its old size ($(human "$actual"))."
+        warn "Reboot, then run \"Grow\" again on the same partition to finish the operation."
         return 2
     fi
-    ok "Partizione $part ora di $(human "$expected")."
+    ok "Partition $part is now $(human "$expected")."
 }
 
 temp_mount() {
@@ -977,7 +1027,7 @@ temp_umount() {
     PW_TMP_MOUNTS=("${PW_TMP_MOUNTS[@]}")
 }
 
-# ID del dispositivo all'interno di un file system btrfs (multi-dispositivo)
+# ID of the device inside a (possibly multi-device) btrfs file system
 btrfs_devid() {
     local dev=$1 mnt=$2 real line
     real=$(readlink -f "$dev")
@@ -997,13 +1047,13 @@ e2fsck_ok() {
     run e2fsck -f -p "$1"
     rc=$?
     if (( rc >= 4 )); then
-        err "e2fsck ha trovato errori che non può correggere automaticamente (codice $rc). Esegui 'e2fsck -f $1' manualmente."
+        err "e2fsck found errors it cannot fix automatically (code $rc). Run 'e2fsck -f $1' manually."
         return 1
     fi
     return 0
 }
 
-# Espande il file system TYPE sul dispositivo DEV fino a occuparlo tutto
+# Grows file system TYPE on device DEV to fill the whole device
 grow_fs() {
     local dev=$1 t=$2 mnt tmp="" rc=0 devid uuid label was_active=0 args=()
     case $t in
@@ -1037,11 +1087,11 @@ grow_fs() {
         ntfs)
             ensure_cmds ntfsresize || return 1
             if [[ -n $(mountpoint_of "$dev") ]]; then
-                err "La partizione NTFS $dev è montata: smontala prima di espanderla."
+                err "NTFS partition $dev is mounted: unmount it before growing it."
                 return 1
             fi
             run_input y ntfsresize -f "$dev" || rc=$?
-            (( rc == 0 )) && info "Al prossimo avvio Windows eseguirà un controllo del disco: è normale."
+            (( rc == 0 )) && info "Windows will run a disk check at its next boot: this is normal."
             ;;
         swap)
             uuid=$(fs_prop "$dev" UUID)
@@ -1056,15 +1106,15 @@ grow_fs() {
             (( was_active )) && run swapon "$dev"
             ;;
         *)
-            warn "Espansione automatica non supportata per '$t'."
+            warn "Automatic growing is not supported for '$t'."
             return 1
             ;;
     esac
     [[ -n $tmp ]] && temp_umount "$tmp"
     if (( rc == 0 )); then
-        ok "File system $t su $dev espanso."
+        ok "File system $t on $dev grown."
     else
-        err "Espansione del file system $t su $dev non riuscita (codice $rc)."
+        err "Growing file system $t on $dev failed (code $rc)."
     fi
     return "$rc"
 }
@@ -1073,31 +1123,31 @@ grow_luks() {
     local dev=$1 mapper
     mapper=$(lsblk -lnpo NAME,TYPE "$dev" 2>/dev/null | awk '$2 == "crypt" { print $1; exit }')
     if [[ -z $mapper ]]; then
-        warn "Il volume cifrato LUKS su $dev non è aperto: verrà usato tutto lo spazio alla prossima apertura."
-        warn "Dopo averlo aperto, espandi il contenuto con questo wizard (opzione \"Espandi\")."
+        warn "The LUKS volume on $dev is not open: it will use all the space the next time it is opened."
+        warn "After opening it, grow its contents with this wizard (\"Grow\" option)."
         return 0
     fi
     ensure_cmds cryptsetup || return 1
-    info "Ridimensiono il volume cifrato $mapper (potrebbe essere richiesta la passphrase)."
-    run cryptsetup resize "$mapper" || { err "cryptsetup resize non riuscito."; return 1; }
-    ok "Volume cifrato $mapper espanso."
+    info "Resizing encrypted volume $mapper (the passphrase may be requested)."
+    run cryptsetup resize "$mapper" || { err "cryptsetup resize failed."; return 1; }
+    ok "Encrypted volume $mapper grown."
     grow_contents "$mapper"
 }
 
 grow_pv() {
     local dev=$1 vg
     ensure_cmds pvresize pvs || return 1
-    run pvresize "$dev" || { err "pvresize non riuscito."; return 1; }
-    ok "Volume fisico LVM $dev espanso."
+    run pvresize "$dev" || { err "pvresize failed."; return 1; }
+    ok "LVM physical volume $dev grown."
     vg=$(trim "$(pvs --noheadings -o vg_name "$dev" 2>/dev/null)")
     [[ -n $vg ]] || return 0
     pause_if_tui
-    if ui_yesno "LVM" "Il nuovo spazio è ora disponibile nel gruppo di volumi \"$vg\".\n\nVuoi assegnarlo subito a un volume logico (espandendone anche il file system)?"; then
+    if ui_yesno "LVM" "The new space is now available in volume group \"$vg\".\n\nAssign it to a logical volume now (growing its file system too)?"; then
         lvm_extend "$vg"
     fi
 }
 
-# Espande ricorsivamente il contenuto di un dispositivo appena ingrandito:
+# Recursively grows the contents of a device that has just been enlarged:
 # LUKS -> LVM -> file system.
 grow_contents() {
     local dev=$1 t
@@ -1107,17 +1157,17 @@ grow_contents() {
         LVM2_member) grow_pv "$dev" ;;
         ext2 | ext3 | ext4 | xfs | btrfs | ntfs | swap) grow_fs "$dev" "$t" ;;
         "")
-            info "Nessun file system rilevato su $dev: è stata ingrandita solo la partizione."
+            info "No file system found on $dev: only the partition was grown."
             return 0
             ;;
         *)
-            warn "Il contenuto '$t' di $dev non è supportato per l'espansione automatica: espandilo manualmente."
+            warn "Contents '$t' of $dev cannot be grown automatically: please grow it manually."
             return 0
             ;;
     esac
 }
 
-# Dimensione minima (byte) del file system, per la riduzione
+# Minimum size (bytes) of the file system, for shrinking
 fs_min_bytes() {
     local dev=$1 t=$2 mnt=${3:-} devid=${4:-1} blocks bs out
     case $t in
@@ -1144,10 +1194,10 @@ fs_min_bytes() {
     esac
 }
 
-# Riduce la partizione NR fino al settore NEW_END: prima riduce il file
-# system (con un piccolo margine), poi la partizione, infine riespande il file
-# system per occupare esattamente la nuova partizione.
-# Per ext2/3/4 e NTFS il file system deve essere smontato.
+# Shrinks partition NR so that it ends at sector NEW_END: first the file system
+# is shrunk (with a small margin), then the partition, and finally the file
+# system is grown again to fill the new partition exactly.
+# ext2/3/4 and NTFS file systems must be unmounted.
 op_shrink() {
     local disk=$1 nr=$2 new_end=$3 i start part t new_bytes fs_target margin mnt tmp="" devid
     local rc=0 uuid label was_active=0 args=()
@@ -1168,7 +1218,7 @@ op_shrink() {
                 e2fsck_ok "$part" || return 1
             fi
             PW_FSCK_DONE=""
-            run resize2fs "$part" "$(( fs_target / 1024 ))K" || { err "Riduzione del file system non riuscita: nessuna modifica alla partizione."; return 1; }
+            run resize2fs "$part" "$(( fs_target / 1024 ))K" || { err "Shrinking the file system failed: the partition was not changed."; return 1; }
             set_part_end "$disk" "$nr" "$new_end" || return $?
             run resize2fs "$part" || rc=$?
             ;;
@@ -1181,7 +1231,7 @@ op_shrink() {
             fi
             devid=$(btrfs_devid "$part" "$mnt")
             if ! run btrfs filesystem resize "$devid:$fs_target" "$mnt"; then
-                err "Riduzione del file system non riuscita: nessuna modifica alla partizione."
+                err "Shrinking the file system failed: the partition was not changed."
                 [[ -n $tmp ]] && temp_umount "$tmp"
                 return 1
             fi
@@ -1191,10 +1241,10 @@ op_shrink() {
             ;;
         ntfs)
             ensure_cmds ntfsresize || return 1
-            run_input y ntfsresize -f -s "$fs_target" "$part" || { err "Riduzione del file system non riuscita: nessuna modifica alla partizione."; return 1; }
+            run_input y ntfsresize -f -s "$fs_target" "$part" || { err "Shrinking the file system failed: the partition was not changed."; return 1; }
             set_part_end "$disk" "$nr" "$new_end" || return $?
             run_input y ntfsresize -f "$part" || rc=$?
-            (( rc == 0 )) && info "Al prossimo avvio Windows eseguirà un controllo del disco: è normale."
+            (( rc == 0 )) && info "Windows will run a disk check at its next boot: this is normal."
             ;;
         swap)
             uuid=$(fs_prop "$part" UUID)
@@ -1215,15 +1265,15 @@ op_shrink() {
             set_part_end "$disk" "$nr" "$new_end" || rc=$?
             ;;
         *)
-            err "La riduzione di '$t' non è supportata."
+            err "Shrinking '$t' is not supported."
             return 1
             ;;
     esac
     return "$rc"
 }
 
-# Crea una partizione da START a END (settori) e la formatta.
-# Imposta CREATED_PART con il dispositivo creato.
+# Creates a partition from START to END (sectors) and formats it.
+# Sets CREATED_PART to the new device.
 op_create() {
     local disk=$1 start=$2 end=$3 fs=$4 label=$5 type nr="" i part
     CREATED_PART=""
@@ -1241,14 +1291,14 @@ op_create() {
         for i in "${!T_NR[@]}"; do
             [[ ${T_START[i]} == "$start" ]] && nr=${T_NR[i]}
         done
-        [[ -n $nr ]] || { err "Partizione appena creata non trovata nella tabella."; return 1; }
+        [[ -n $nr ]] || { err "The new partition was not found in the table."; return 1; }
     fi
     part=$(part_dev "$disk" "$nr")
     if (( ! PW_DRY_RUN )) && ! wait_for_dev "$part"; then
-        err "Il dispositivo $part non è comparso: riavvia il sistema e formatta la partizione manualmente."
+        err "Device $part did not appear: reboot and format the partition manually."
         return 1
     fi
-    ok "Creata la partizione $part."
+    ok "Partition $part created."
     CREATED_PART=$part
     [[ $fs == none ]] && return 0
     run wipefs -a "$part" >/dev/null
@@ -1300,16 +1350,16 @@ op_delete() {
     part=$(part_dev "$disk" "$nr")
     backup_table "$disk"
     if (( wipe )) && [[ -b $part ]]; then
-        run wipefs -a "$part" || warn "wipefs non riuscito: proseguo comunque."
+        run wipefs -a "$part" || warn "wipefs failed: continuing anyway."
     fi
     run sfdisk "${SFDISK_OPTS[@]}" --delete "$disk" "$nr" || return 1
     (( PW_DRY_RUN )) || partx -d --nr "$nr" "$disk" >/dev/null 2>&1
     reread_table "$disk"
-    ok "Partizione $part eliminata."
+    ok "Partition $part deleted."
 }
 
-# Righe di FILE (fstab o crypttab) che fanno riferimento al dispositivo DEV.
-# FIELD è il campo che contiene il dispositivo (1 per fstab, 2 per crypttab).
+# Lines of FILE (fstab or crypttab) that refer to device DEV.
+# FIELD is the field holding the device (1 for fstab, 2 for crypttab).
 config_refs() {
     local dev=$1 file=$2 field=$3 keys=() v link
     [[ -r $file ]] || return 0
@@ -1327,15 +1377,15 @@ config_refs() {
         { d = $f; gsub(/"/, "", d); if (d in k) print NR }' "$file"
 }
 
-comment_config_lines() {   # file numeri_di_riga...
+comment_config_lines() {   # file line_numbers...
     local file=$1 n bak
     shift
     bak="$file.partition-wizard-$(date +%Y%m%d-%H%M%S).bak"
     run cp -a "$file" "$bak" || return 1
     for n in "$@"; do
-        run sed -i "${n}s/^/# rimossa da partition-wizard: /" "$file" || return 1
+        run sed -i "${n}s/^/# removed by partition-wizard: /" "$file" || return 1
     done
-    ok "Righe commentate in $file (copia di sicurezza: $bak)."
+    ok "Lines commented out in $file (backup copy: $bak)."
 }
 
 systemd_reload() {
@@ -1345,28 +1395,28 @@ systemd_reload() {
     return 0
 }
 
-# Aggiunge la nuova partizione a /etc/fstab e la monta
+# Adds the new partition to /etc/fstab and mounts it
 setup_mount() {
     local dev=$1 t=$2 mnt uuid pass=2 line bak
     while :; do
-        mnt=$(ui_input "Montaggio automatico" "Vuoi montare la nuova partizione $dev automaticamente all'avvio?\n\nInserisci il punto di montaggio (es. /mnt/dati oppure /srv/backup)\noppure lascia vuoto per non montarla." "") || return 0
+        mnt=$(ui_input "Automatic mount" "Mount the new partition $dev automatically at boot?\n\nEnter the mount point (e.g. /mnt/data or /srv/backup)\nor leave it empty to skip mounting." "") || return 0
         mnt=$(trim "$mnt")
         [[ -z $mnt ]] && return 0
         if [[ $mnt != /* || $mnt == *[[:space:]]* || $mnt == / ]]; then
-            ui_msg "Montaggio automatico" "Percorso non valido: deve essere assoluto e senza spazi."
+            ui_msg "Automatic mount" "Invalid path: it must be absolute and contain no spaces."
             continue
         fi
         if findmnt -n "$mnt" >/dev/null 2>&1; then
-            ui_msg "Montaggio automatico" "Su $mnt è già montato un altro file system: scegli un altro percorso."
+            ui_msg "Automatic mount" "Another file system is already mounted on $mnt: choose a different path."
             continue
         fi
         if [[ -d $mnt && -n $(ls -A "$mnt" 2>/dev/null) ]]; then
-            ui_yesno "Montaggio automatico" "La cartella $mnt non è vuota: il suo contenuto verrebbe nascosto dalla nuova partizione.\n\nUsarla comunque?" no || continue
+            ui_yesno "Automatic mount" "Directory $mnt is not empty: its contents would be hidden by the new partition.\n\nUse it anyway?" no || continue
         fi
         break
     done
     uuid=$(fs_prop "$dev" UUID)
-    [[ -n $uuid ]] || uuid="<UUID-di-$dev>"
+    [[ -n $uuid ]] || uuid="<UUID-of-$dev>"
     case $t in xfs | btrfs | vfat) pass=0 ;; esac
     line="UUID=$uuid  $mnt  $t  defaults,nofail  0  $pass"
     bak="/etc/fstab.partition-wizard-$(date +%Y%m%d-%H%M%S).bak"
@@ -1375,9 +1425,9 @@ setup_mount() {
     run_input "$line" tee -a /etc/fstab >/dev/null || return 1
     systemd_reload
     if run mount "$mnt"; then
-        ok "Partizione montata su $mnt e aggiunta a /etc/fstab."
+        ok "Partition mounted on $mnt and added to /etc/fstab."
     else
-        err "Montaggio non riuscito: ripristino /etc/fstab dalla copia di sicurezza."
+        err "Mounting failed: restoring /etc/fstab from the backup copy."
         run cp -a "$bak" /etc/fstab
         systemd_reload
     fi
@@ -1385,20 +1435,20 @@ setup_mount() {
 
 setup_swap() {
     local dev=$1 uuid bak
-    ui_yesno "Swap" "Vuoi attivare subito la nuova swap $dev e aggiungerla a /etc/fstab per gli avvii successivi?" || return 0
+    ui_yesno "Swap" "Activate the new swap $dev now and add it to /etc/fstab for the next boots?" || return 0
     uuid=$(fs_prop "$dev" UUID)
-    [[ -n $uuid ]] || uuid="<UUID-di-$dev>"
+    [[ -n $uuid ]] || uuid="<UUID-of-$dev>"
     bak="/etc/fstab.partition-wizard-$(date +%Y%m%d-%H%M%S).bak"
     run cp -a /etc/fstab "$bak" || return 1
     run_input "UUID=$uuid  none  swap  sw  0  0" tee -a /etc/fstab >/dev/null || return 1
     systemd_reload
-    run swapon "$dev" && ok "Swap attivata."
+    run swapon "$dev" && ok "Swap activated."
 }
 
-# Calcola il nuovo settore finale a partire dalla risposta dell'utente.
-# compute_end RISPOSTA INIZIO FINE_ATTUALE LIMITE MODO [MINIMO_BYTE]
-#   MODO: grow | shrink | create
-# Imposta NEW_END, oppure SIZE_ERR e restituisce 1.
+# Computes the new end sector from the user's answer.
+# compute_end ANSWER START CURRENT_END LIMIT MODE [MIN_BYTES]
+#   MODE: grow | shrink | create
+# Sets NEW_END, or sets SIZE_ERR and returns 1.
 compute_end() {
     local spec start=$2 cur_end=$3 limit=$4 mode=$5 min=${6:-0} cur align bytes secs
     spec=$(trim "${1,,}")
@@ -1407,9 +1457,9 @@ compute_end() {
     cur=$(( (cur_end - start + 1) * T_SS ))
     [[ $mode == create ]] && cur=0
     NEW_END="" SIZE_ERR=""
-    if [[ $spec == max || $spec == tutto || $spec == 100% ]]; then
+    if [[ $spec == max || $spec == all || $spec == 100% ]]; then
         if [[ $mode == shrink ]]; then
-            SIZE_ERR="Per ridurre indica una dimensione (es. 20G oppure -5G)."
+            SIZE_ERR="To shrink, enter a size (e.g. 20G or -5G)."
             return 1
         fi
         NEW_END=$limit
@@ -1419,33 +1469,33 @@ compute_end() {
         +*) bytes=$(parse_size "${spec#+}") && bytes=$(( cur + bytes )) ;;
         -*) bytes=$(parse_size "${spec#-}") && bytes=$(( cur - bytes )) ;;
         *) bytes=$(parse_size "$spec") ;;
-    esac || { SIZE_ERR="Dimensione non valida: \"$1\". Esempi: 500M, 20G, 1.5T."; return 1; }
+    esac || { SIZE_ERR="Invalid size: \"$1\". Examples: 500M, 20G, 1.5T."; return 1; }
     secs=$(( bytes / T_SS / align * align ))
     if (( secs <= 0 )); then
-        SIZE_ERR="La dimensione deve essere di almeno 1 MiB."
+        SIZE_ERR="The size must be at least 1 MiB."
         return 1
     fi
     NEW_END=$(( start + secs - 1 ))
     case $mode in
         grow)
             if (( NEW_END <= cur_end )); then
-                SIZE_ERR="La nuova dimensione deve essere maggiore di quella attuale ($(human "$cur"))."
+                SIZE_ERR="The new size must be larger than the current one ($(human "$cur"))."
                 return 1
             fi
             ;;
         shrink)
             if (( NEW_END >= cur_end )); then
-                SIZE_ERR="La nuova dimensione deve essere minore di quella attuale ($(human "$cur"))."
+                SIZE_ERR="The new size must be smaller than the current one ($(human "$cur"))."
                 return 1
             fi
             if (( secs * T_SS < min )); then
-                SIZE_ERR="Dimensione troppo piccola: il minimo consigliato è $(human "$min")."
+                SIZE_ERR="Size too small: the recommended minimum is $(human "$min")."
                 return 1
             fi
             ;;
     esac
     if (( NEW_END > limit )); then
-        SIZE_ERR="Spazio insufficiente: la dimensione massima è $(human $(( (limit - start + 1) * T_SS )))."
+        SIZE_ERR="Not enough space: the maximum size is $(human $(( (limit - start + 1) * T_SS )))."
         return 1
     fi
     return 0
@@ -1457,9 +1507,9 @@ compute_end() {
 
 vg_field() { trim "$(vgs --noheadings --units b --nosuffix -o "$2" "$1" 2>/dev/null)"; }
 
-# Espande un volume logico (facoltativamente solo quelli del gruppo VG)
+# Extends a logical volume (optionally only those of volume group VG)
 lvm_extend() {
-    local title="Espandi volume logico" only_vg=${1:-} path size vg attr items=() lv
+    local title="Extend logical volume" only_vg=${1:-} path size vg attr items=() lv
     local vgfree ext lvsize ans bytes n args=()
     ensure_cmds lvs vgs lvextend || return 0
     while IFS='|' read -r path size vg attr; do
@@ -1467,26 +1517,26 @@ lvm_extend() {
         [[ -n $path ]] || continue
         [[ ${attr:0:1} == "-" || ${attr:0:1} == "o" ]] || continue
         [[ -z $only_vg || $vg == "$only_vg" ]] || continue
-        items+=("$path" "$(human "$size")  (gruppo $vg, liberi $(human "$(vg_field "$vg" vg_free)"))")
+        items+=("$path" "$(human "$size")  (group $vg, $(human "$(vg_field "$vg" vg_free)") free)")
     done < <(lvs --noheadings --units b --nosuffix --separator '|' -o lv_path,lv_size,vg_name,lv_attr 2>/dev/null)
     if (( ${#items[@]} == 0 )); then
-        ui_msg "$title" "Nessun volume logico trovato${only_vg:+ nel gruppo $only_vg}."
+        ui_msg "$title" "No logical volumes found${only_vg:+ in group $only_vg}."
         return 0
     fi
-    lv=$(ui_menu "$title" "Seleziona il volume logico da espandere:" "${items[@]}") || return 0
+    lv=$(ui_menu "$title" "Select the logical volume to extend:" "${items[@]}") || return 0
     vg=$(trim "$(lvs --noheadings -o vg_name "$lv" 2>/dev/null)")
     lvsize=$(trim "$(lvs --noheadings --units b --nosuffix -o lv_size "$lv" 2>/dev/null)")
     vgfree=$(vg_field "$vg" vg_free)
     ext=$(vg_field "$vg" vg_extent_size)
     if ! [[ $vgfree =~ ^[0-9]+$ && $ext =~ ^[0-9]+$ ]] || (( vgfree < ext )); then
-        ui_msg "$title" "Il gruppo di volumi \"$vg\" non ha spazio libero.\n\nPer aggiungere spazio puoi:\n • espandere la partizione che contiene il volume fisico (menu \"Espandi una partizione\");\n • aggiungere una partizione o un disco al gruppo (menu LVM → \"Aggiungi una partizione\")."
+        ui_msg "$title" "Volume group \"$vg\" has no free space.\n\nTo add space you can:\n * grow the partition holding the physical volume (\"Grow a partition\" menu);\n * add a partition or a disk to the group (LVM menu -> \"Add a partition\")."
         return 0
     fi
     while :; do
-        ans=$(ui_input "$title" "Volume logico: $lv\nDimensione attuale: $(human "$lvsize")\nSpazio libero nel gruppo $vg: $(human "$vgfree")\n\nQuanto spazio vuoi aggiungere?\n  max  → tutto lo spazio libero\n  10G  → aggiungi 10 GiB\n(unità accettate: M, G, T)" "max") || return 0
+        ans=$(ui_input "$title" "Logical volume: $lv\nCurrent size: $(human "$lvsize")\nFree space in group $vg: $(human "$vgfree")\n\nHow much space do you want to add?\n  max  -> all the free space\n  10G  -> add 10 GiB\n(accepted units: M, G, T)" "max") || return 0
         ans=$(trim "${ans,,}")
         ans=${ans#+}
-        if [[ $ans == max || $ans == tutto || $ans == 100% ]]; then
+        if [[ $ans == max || $ans == all || $ans == 100% ]]; then
             args=(-l +100%FREE)
             bytes=$(( vgfree / ext * ext ))
             break
@@ -1499,72 +1549,72 @@ lvm_extend() {
                 break
             fi
         fi
-        ui_msg "$title" "Valore non valido: indica una quantità tra $(human "$ext") e $(human "$vgfree"), oppure max."
+        ui_msg "$title" "Invalid value: enter an amount between $(human "$ext") and $(human "$vgfree"), or max."
     done
-    ui_yesno "$title" "Riepilogo:\n\n  Volume logico: $lv\n  Dimensione:    $(human "$lvsize") → $(human $(( lvsize + bytes )))\n  Contenuto:     $(fs_type "$lv")\n\nAnche il file system verrà espanso. Procedere?" || return 0
+    ui_yesno "$title" "Summary:\n\n  Logical volume: $lv\n  Size:           $(human "$lvsize") -> $(human $(( lvsize + bytes )))\n  Contents:       $(fs_type "$lv")\n\nThe file system will be grown too. Continue?" || return 0
     screen_start "$title"
     critical_begin
     if run lvextend "${args[@]}" "$lv"; then
-        ok "Volume logico $lv espanso."
+        ok "Logical volume $lv extended."
         grow_contents "$lv"
     else
-        err "lvextend non riuscito."
+        err "lvextend failed."
     fi
     critical_end
     lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT "$lv" >&2 2>/dev/null
 }
 
 lvm_add_pv() {
-    local title="Aggiungi spazio a un gruppo di volumi" vgs_list=() items=() v disk part t pvvg vg
+    local title="Add space to a volume group" vgs_list=() items=() v disk part t pvvg vg
     ensure_cmds pvcreate vgextend vgs pvs || return 0
     mapfile -t vgs_list < <(vgs --noheadings -o vg_name 2>/dev/null | awk 'NF { print $1 }')
     if (( ${#vgs_list[@]} == 0 )); then
-        ui_msg "$title" "Nessun gruppo di volumi LVM trovato su questo sistema."
+        ui_msg "$title" "No LVM volume groups found on this system."
         return 0
     fi
-    disk=$(select_disk "$title" "Seleziona il disco che contiene la partizione da aggiungere:") || return 0
-    part=$(select_partition "$disk" "$title" "Seleziona la partizione da aggiungere al gruppo di volumi.\nATTENZIONE: il suo contenuto attuale verrà cancellato.") || return 0
+    disk=$(select_disk "$title" "Select the disk holding the partition to add:") || return 0
+    part=$(select_partition "$disk" "$title" "Select the partition to add to the volume group.\nWARNING: its current contents will be erased.") || return 0
     if dev_in_use "$part"; then
-        ui_msg "$title" "La partizione $part è in uso (montata, swap attiva o usata da LVM/LUKS): non può essere aggiunta."
+        ui_msg "$title" "Partition $part is in use (mounted, active swap or used by LVM/LUKS): it cannot be added."
         return 0
     fi
     t=$(fs_type "$part")
     if [[ $t == LVM2_member ]]; then
         pvvg=$(trim "$(pvs --noheadings -o vg_name "$part" 2>/dev/null)")
         if [[ -n $pvvg ]]; then
-            ui_msg "$title" "La partizione $part fa già parte del gruppo di volumi \"$pvvg\"."
+            ui_msg "$title" "Partition $part already belongs to volume group \"$pvvg\"."
             return 0
         fi
     fi
     for v in "${vgs_list[@]}"; do
-        items+=("$v" "liberi $(human "$(vg_field "$v" vg_free)") su $(human "$(vg_field "$v" vg_size)")")
+        items+=("$v" "$(human "$(vg_field "$v" vg_free)") free of $(human "$(vg_field "$v" vg_size)")")
     done
-    vg=$(ui_menu "$title" "A quale gruppo di volumi vuoi aggiungere $part?" "${items[@]}") || return 0
+    vg=$(ui_menu "$title" "Which volume group should $part be added to?" "${items[@]}") || return 0
     if [[ -n $t && $t != LVM2_member ]]; then
-        ui_confirm_typed "$title" "La partizione $part contiene: $t.\nTutti i dati presenti verranno CANCELLATI." "$(basename "$part")" || return 0
+        ui_confirm_typed "$title" "Partition $part contains: $t.\nALL THE DATA ON IT WILL BE ERASED." "$(basename "$part")" || return 0
     else
-        ui_yesno "$title" "Aggiungere $part ($(human "$(dev_bytes "$part")")) al gruppo di volumi \"$vg\"?" || return 0
+        ui_yesno "$title" "Add $part ($(human "$(dev_bytes "$part")")) to volume group \"$vg\"?" || return 0
     fi
     screen_start "$title"
     critical_begin
     if [[ $t != LVM2_member ]]; then
         if ! { run wipefs -a "$part" && run pvcreate "$part"; }; then
             critical_end
-            err "Creazione del volume fisico non riuscita."
+            err "Creating the physical volume failed."
             pause
             return 0
         fi
     fi
     if run vgextend "$vg" "$part"; then
-        ok "$part aggiunta al gruppo di volumi $vg."
+        ok "$part added to volume group $vg."
         critical_end
         pause_if_tui
-        if ui_yesno "$title" "Vuoi assegnare subito il nuovo spazio a un volume logico?"; then
+        if ui_yesno "$title" "Assign the new space to a logical volume now?"; then
             lvm_extend "$vg"
         fi
     else
         critical_end
-        err "vgextend non riuscito."
+        err "vgextend failed."
     fi
     pause
 }
@@ -1575,18 +1625,18 @@ wizard_lvm() {
         ensure_cmds lvm || return 0
     fi
     while :; do
-        choice=$(ui_menu "LVM" "Gestione dei volumi logici (LVM):" \
-            1 "Espandi un volume logico (e il suo file system)" \
-            2 "Aggiungi una partizione a un gruppo di volumi" \
-            3 "Mostra riepilogo LVM") || return 0
+        choice=$(ui_menu "LVM" "Logical volume management (LVM):" \
+            1 "Extend a logical volume (and its file system)" \
+            2 "Add a partition to a volume group" \
+            3 "Show LVM summary") || return 0
         case $choice in
             1) lvm_extend; pause ;;
             2) lvm_add_pv ;;
             3)
-                screen_start "Riepilogo LVM"
-                printf '\nVolumi fisici:\n' >&2;  pvs >&2 2>/dev/null
-                printf '\nGruppi di volumi:\n' >&2; vgs >&2 2>/dev/null
-                printf '\nVolumi logici:\n' >&2; lvs >&2 2>/dev/null
+                screen_start "LVM summary"
+                printf '\nPhysical volumes:\n' >&2;  pvs >&2 2>/dev/null
+                printf '\nVolume groups:\n' >&2; vgs >&2 2>/dev/null
+                printf '\nLogical volumes:\n' >&2; lvs >&2 2>/dev/null
                 pause
                 ;;
         esac
@@ -1594,39 +1644,39 @@ wizard_lvm() {
 }
 
 # -----------------------------------------------------------------------------
-# Wizard
+# Wizards
 # -----------------------------------------------------------------------------
 
 show_overview() {
     local d s e args=(-o "NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT") regions=() r gap
     (( PW_INCLUDE_LOOP )) || args+=(-e 7)
     [[ $PW_UI == whiptail && -t 1 ]] && clear
-    ui_header "Dischi e partizioni"
+    ui_header "Disks and partitions"
     lsblk "${args[@]}" >&2
-    ui_header "Spazio non allocato"
+    ui_header "Unallocated space"
     for d in $(list_disks); do
         if ! load_table "$d"; then
-            printf '%s (%s): nessuna tabella delle partizioni%s\n' "$d" "$(human "$(dev_bytes "$d")")" \
-                "$(t=$(fs_type "$d"); [[ -n $t ]] && printf ', contiene direttamente %s' "$t")" >&2
+            printf '%s (%s): no partition table%s\n' "$d" "$(human "$(dev_bytes "$d")")" \
+                "$(t=$(fs_type "$d"); [[ -n $t ]] && printf ', directly contains %s' "$t")" >&2
             continue
         fi
         printf '%s (%s, %s):\n' "$d" "$(human "$(dev_bytes "$d")")" "${T_LABEL^^}" >&2
         mapfile -t regions < <(free_regions)
         if (( ${#regions[@]} == 0 )); then
-            printf '    nessuno spazio libero\n' >&2
+            printf '    no free space\n' >&2
         fi
         for r in "${regions[@]}"; do
             read -r s e <<<"$r"
-            printf '    libero: %-12s (settori %s - %s)\n' "$(human $(( (e - s + 1) * T_SS )))" "$s" "$e" >&2
+            printf '    free: %-12s (sectors %s - %s)\n' "$(human $(( (e - s + 1) * T_SS )))" "$s" "$e" >&2
         done
         gap=$(gpt_tail_gap)
         if (( gap >= MIB )); then
-            printf '    %s%s alla fine del disco non sono ancora utilizzabili: usa "Rileva il nuovo spazio".%s\n' \
+            printf '    %s%s at the end of the disk cannot be used yet: use "Detect new space".%s\n' \
                 "$C_YELLOW" "$(human "$gap")" "$C_RESET" >&2
         fi
     done
     if command -v vgs >/dev/null 2>&1 && [[ -n $(vgs --noheadings 2>/dev/null) ]]; then
-        ui_header "Gruppi di volumi LVM"
+        ui_header "LVM volume groups"
         vgs >&2 2>/dev/null
         printf '\n' >&2
         lvs >&2 2>/dev/null
@@ -1635,8 +1685,8 @@ show_overview() {
 }
 
 wizard_expand() {
-    local title="Espandi partizione" disk part nr i start cur_end max_end free t mnt ans cur new_size j next=""
-    disk=$(select_disk "$title" "Seleziona il disco che contiene la partizione da espandere:") || return 0
+    local title="Grow partition" disk part nr i start cur_end max_end free t mnt ans cur new_size j next=""
+    disk=$(select_disk "$title" "Select the disk holding the partition to grow:") || return 0
     screen_start "$title"
     prepare_disk_growth "$disk"
     (( PW_DISK_CHANGED )) && pause_if_tui
@@ -1644,7 +1694,7 @@ wizard_expand() {
     if ! load_table "$disk"; then
         t=$(fs_type "$disk")
         if [[ -n $t ]]; then
-            if ui_yesno "$title" "Il disco $disk non ha partizioni ma contiene direttamente: $t.\n\nVuoi espandere il contenuto per occupare l'intero disco ($(human "$(dev_bytes "$disk")"))?"; then
+            if ui_yesno "$title" "Disk $disk has no partitions but directly contains: $t.\n\nGrow its contents to fill the whole disk ($(human "$(dev_bytes "$disk")"))?"; then
                 screen_start "$title"
                 critical_begin
                 grow_contents "$disk"
@@ -1653,12 +1703,12 @@ wizard_expand() {
                 pause
             fi
         else
-            ui_msg "$title" "Il disco $disk non contiene né una tabella delle partizioni né un file system.\nUsa \"Crea una nuova partizione\"."
+            ui_msg "$title" "Disk $disk contains neither a partition table nor a file system.\nUse \"Create a new partition\"."
         fi
         return 0
     fi
 
-    part=$(select_partition "$disk" "$title" "Seleziona la partizione da espandere:") || return 0
+    part=$(select_partition "$disk" "$title" "Select the partition to grow:") || return 0
     nr=$(part_nr "$part")
     i=$(tbl_idx "$nr") || return 0
     start=${T_START[i]}
@@ -1676,16 +1726,16 @@ wizard_expand() {
                 next=$j
             fi
         done
-        local why="Non c'è spazio non allocato subito dopo $part: la partizione non può essere ingrandita."
+        local why="There is no unallocated space right after $part, so it cannot be grown."
         if [[ -n $next ]]; then
             if is_extended_idx "$next"; then
-                why+="\n\nSubito dopo si trova la partizione estesa n. ${T_NR[next]} (con le partizioni logiche, spesso la swap). Per ingrandire $part dovresti prima eliminare le partizioni che la seguono."
+                why+="\n\nIt is followed by extended partition ${T_NR[next]} (with the logical partitions, often the swap). To grow $part you would first have to delete the partitions that follow it."
             else
-                why+="\n\nSubito dopo si trova $(part_dev "$disk" "${T_NR[next]}") ($(fs_type "$(part_dev "$disk" "${T_NR[next]}")")). Per ingrandire $part dovresti prima eliminarla (se non serve) o spostarla con uno strumento come GParted da una live USB."
+                why+="\n\nIt is followed by $(part_dev "$disk" "${T_NR[next]}") ($(fs_type "$(part_dev "$disk" "${T_NR[next]}")")). To grow $part you would first have to delete it (if it is not needed) or move it with a tool such as GParted from a live USB."
             fi
         fi
         if [[ -n $t ]]; then
-            if ui_yesno "$title" "$why\n\nSe la partizione è già stata ingrandita in precedenza, posso comunque espandere il suo contenuto ($t) per occupare tutta la partizione.\n\nVuoi farlo ora?" no; then
+            if ui_yesno "$title" "$why\n\nIf the partition was already enlarged earlier, its contents ($t) can still be grown to fill the whole partition.\n\nDo it now?" no; then
                 screen_start "$title"
                 critical_begin
                 grow_contents "$part"
@@ -1700,13 +1750,13 @@ wizard_expand() {
     fi
 
     while :; do
-        ans=$(ui_input "$title" "Partizione: $part (${t:-nessun file system})\nDimensione attuale: $(human "$cur")\nSpazio libero subito dopo: $(human "$free")\nDimensione massima: $(human $(( (max_end - start + 1) * T_SS )))\n\nInserisci la nuova dimensione:\n  max   → usa tutto lo spazio libero\n  50G   → dimensione totale di 50 GiB\n  +10G  → aggiungi 10 GiB\n(unità accettate: M, G, T)" "max") || return 0
+        ans=$(ui_input "$title" "Partition: $part (${t:-no file system})\nCurrent size: $(human "$cur")\nFree space right after it: $(human "$free")\nMaximum size: $(human $(( (max_end - start + 1) * T_SS )))\n\nEnter the new size:\n  max   -> use all the free space\n  50G   -> total size of 50 GiB\n  +10G  -> add 10 GiB\n(accepted units: M, G, T)" "max") || return 0
         compute_end "$ans" "$start" "$cur_end" "$max_end" grow && break
         ui_msg "$title" "$SIZE_ERR"
     done
     new_size=$(( (NEW_END - start + 1) * T_SS ))
 
-    ui_yesno "$title" "Riepilogo dell'operazione:\n\n  Disco:       $disk\n  Partizione:  $part\n  Contenuto:   ${t:-nessuno}${mnt:+ (montato su $mnt)}\n  Dimensione:  $(human "$cur") → $(human "$new_size")\n\nVerranno espansi la partizione e il suo contenuto (LUKS, LVM, file system). L'operazione si può eseguire anche con la partizione in uso.\nPrima della modifica viene salvato un backup della tabella delle partizioni.\n\nProcedere?" || return 0
+    ui_yesno "$title" "Summary:\n\n  Disk:       $disk\n  Partition:  $part\n  Contents:   ${t:-none}${mnt:+ (mounted on $mnt)}\n  Size:       $(human "$cur") -> $(human "$new_size")\n\nThe partition and its contents (LUKS, LVM, file system) will be grown. This also works while the partition is in use.\nA backup of the partition table is saved before the change.\n\nContinue?" || return 0
 
     screen_start "$title"
     critical_begin
@@ -1719,10 +1769,10 @@ wizard_expand() {
 }
 
 wizard_shrink() {
-    local title="Riduci partizione" disk part nr i start cur_end cur t mnt min suggested ans new_size
+    local title="Shrink partition" disk part nr i start cur_end cur t mnt min suggested ans new_size
     local unmounted="" tmp="" devid=1 was_swap=0
-    disk=$(select_disk "$title" "Seleziona il disco che contiene la partizione da ridurre:") || return 0
-    part=$(select_partition "$disk" "$title" "Seleziona la partizione da ridurre:") || return 0
+    disk=$(select_disk "$title" "Select the disk holding the partition to shrink:") || return 0
+    part=$(select_partition "$disk" "$title" "Select the partition to shrink:") || return 0
     nr=$(part_nr "$part")
     i=$(tbl_idx "$nr") || return 0
     start=${T_START[i]}
@@ -1733,43 +1783,43 @@ wizard_shrink() {
     case $t in
         ext2 | ext3 | ext4 | btrfs | ntfs | swap) ;;
         "")
-            ui_yesno "$title" "La partizione $part non contiene un file system riconosciuto.\nLa riduzione cancellerà definitivamente qualsiasi dato presente nella parte finale.\n\nContinuare?" no || return 0
+            ui_yesno "$title" "Partition $part does not contain a recognised file system.\nShrinking it permanently destroys any data stored in its last part.\n\nContinue?" no || return 0
             ;;
         xfs)
-            ui_msg "$title" "Il file system XFS non può essere ridotto.\n\nL'unica alternativa è copiare i dati altrove, ricreare una partizione più piccola e ripristinarli."
+            ui_msg "$title" "XFS file systems cannot be shrunk.\n\nThe only alternative is to copy the data elsewhere, recreate a smaller partition and restore the data."
             return 0
             ;;
         LVM2_member)
-            ui_msg "$title" "$part è un volume fisico LVM: la riduzione automatica non è supportata.\n\nOccorre ridurre prima i volumi logici (lvreduce -r), poi il volume fisico (pvresize --setphysicalvolumesize) e solo alla fine la partizione."
+            ui_msg "$title" "$part is an LVM physical volume: automatic shrinking is not supported.\n\nShrink the logical volumes first (lvreduce -r), then the physical volume (pvresize --setphysicalvolumesize) and only then the partition."
             return 0
             ;;
         crypto_LUKS)
-            ui_msg "$title" "$part è un volume cifrato LUKS: la riduzione automatica non è supportata."
+            ui_msg "$title" "$part is a LUKS encrypted volume: automatic shrinking is not supported."
             return 0
             ;;
         *)
-            ui_msg "$title" "La riduzione del file system \"$t\" non è supportata."
+            ui_msg "$title" "Shrinking file system \"$t\" is not supported."
             return 0
             ;;
     esac
 
     if [[ -n $(dev_holders "$part") ]]; then
-        ui_msg "$title" "La partizione $part è utilizzata da $(dev_child "$part"): impossibile ridurla."
+        ui_msg "$title" "Partition $part is used by $(dev_child "$part"): it cannot be shrunk."
         return 0
     fi
 
-    # ext2/3/4 e NTFS si possono ridurre solo da smontati; btrfs anche da montato.
+    # ext2/3/4 and NTFS can only be shrunk while unmounted; btrfs also mounted.
     mnt=$(mountpoint_of "$part")
     if [[ -n $mnt && $t != btrfs && $t != swap ]]; then
         if [[ $mnt == / || $mnt == /usr || $mnt == /var || $mnt == /boot ]]; then
-            ui_msg "$title" "La partizione $part è montata su $mnt ed è necessaria al sistema in esecuzione: non può essere smontata.\n\nPer ridurla avvia il computer da una live USB (es. Ubuntu o Fedora live) ed esegui questo script da lì."
+            ui_msg "$title" "Partition $part is mounted on $mnt and is needed by the running system: it cannot be unmounted.\n\nTo shrink it, boot the computer from a live USB (e.g. Ubuntu or Fedora live) and run this script from there."
             return 0
         fi
-        ui_yesno "$title" "La partizione $part è montata su $mnt.\nPer ridurre un file system $t è necessario smontarlo.\n\nSmontarlo ora? (Verrà rimontato al termine.)" || return 0
+        ui_yesno "$title" "Partition $part is mounted on $mnt.\nA $t file system must be unmounted to be shrunk.\n\nUnmount it now? (It will be mounted again at the end.)" || return 0
         screen_start "$title"
         if ! run umount "$mnt"; then
             pause_if_tui
-            ui_msg "$title" "Impossibile smontare $mnt: chiudi i programmi che lo stanno usando e riprova."
+            ui_msg "$title" "Could not unmount $mnt: close the programs using it and try again."
             return 0
         fi
         unmounted=$mnt
@@ -1779,7 +1829,7 @@ wizard_shrink() {
     fi
 
     screen_start "$title"
-    info "Calcolo dello spazio minimo necessario..."
+    info "Computing the minimum space required..."
     case $t in
         ext2 | ext3 | ext4)
             ensure_cmds resize2fs e2fsck dumpe2fs || { _shrink_restore_mount "$part" "$unmounted"; return 0; }
@@ -1801,25 +1851,25 @@ wizard_shrink() {
     esac
     if ! min=$(fs_min_bytes "$part" "$t" "$mnt" "$devid"); then
         pause_if_tui
-        ui_msg "$title" "Impossibile determinare lo spazio minimo richiesto dal file system di $part."
+        ui_msg "$title" "Could not determine the minimum size required by the file system on $part."
         [[ -n $tmp ]] && temp_umount "$tmp"
         _shrink_restore_mount "$part" "$unmounted"
         return 0
     fi
-    # margine: +10% sullo spazio minimo e 32 MiB per la riduzione in due passaggi
+    # margin: +10% over the minimum and 32 MiB for the two-step shrink
     suggested=$(( min + min / 10 + 32 * MIB ))
     suggested=$(( (suggested + MIB - 1) / MIB * MIB ))
     pause_if_tui
 
     if (( suggested >= cur - MIB )); then
-        ui_msg "$title" "La partizione $part ($(human "$cur")) è già quasi piena: il file system richiede almeno $(human "$suggested").\nNon è possibile ridurla."
+        ui_msg "$title" "Partition $part ($(human "$cur")) is almost full: the file system needs at least $(human "$suggested").\nIt cannot be shrunk."
         [[ -n $tmp ]] && temp_umount "$tmp"
         _shrink_restore_mount "$part" "$unmounted"
         return 0
     fi
 
     while :; do
-        ans=$(ui_input "$title" "Partizione: $part (${t:-nessun file system})\nDimensione attuale: $(human "$cur")\nDimensione minima consigliata: $(human "$suggested")\n\nInserisci la nuova dimensione:\n  20G   → dimensione totale di 20 GiB\n  -10G  → riduci di 10 GiB\n(unità accettate: M, G, T)" "") || {
+        ans=$(ui_input "$title" "Partition: $part (${t:-no file system})\nCurrent size: $(human "$cur")\nRecommended minimum size: $(human "$suggested")\n\nEnter the new size:\n  20G   -> total size of 20 GiB\n  -10G  -> shrink by 10 GiB\n(accepted units: M, G, T)" "") || {
             [[ -n $tmp ]] && temp_umount "$tmp"
             _shrink_restore_mount "$part" "$unmounted"
             return 0
@@ -1829,7 +1879,7 @@ wizard_shrink() {
     done
     new_size=$(( (NEW_END - start + 1) * T_SS ))
 
-    if ! ui_yesno "$title" "Riepilogo dell'operazione:\n\n  Disco:       $disk\n  Partizione:  $part (${t:-nessun file system})\n  Dimensione:  $(human "$cur") → $(human "$new_size")\n  Spazio che verrà liberato: $(human $(( cur - new_size )))\n\nATTENZIONE: la riduzione sposta i dati all'interno del file system. Un'interruzione (es. mancanza di corrente) può causare la perdita dei dati. Assicurati di avere un backup.\n\nProcedere?" no; then
+    if ! ui_yesno "$title" "Summary:\n\n  Disk:       $disk\n  Partition:  $part (${t:-no file system})\n  Size:       $(human "$cur") -> $(human "$new_size")\n  Space freed: $(human $(( cur - new_size )))\n\nWARNING: shrinking moves data inside the file system. An interruption (e.g. a power failure) can cause data loss. Make sure you have a backup.\n\nContinue?" no; then
         [[ -n $tmp ]] && temp_umount "$tmp"
         _shrink_restore_mount "$part" "$unmounted"
         return 0
@@ -1838,9 +1888,9 @@ wizard_shrink() {
     screen_start "$title"
     critical_begin
     if op_shrink "$disk" "$nr" "$NEW_END"; then
-        ok "Riduzione completata: $(human $(( cur - new_size ))) ora sono non allocati e puoi usarli con \"Crea una nuova partizione\"."
+        ok "Shrink completed: $(human $(( cur - new_size ))) are now unallocated and can be used with \"Create a new partition\"."
     else
-        err "La riduzione non è stata completata. Controlla i messaggi qui sopra."
+        err "The shrink was not completed. Check the messages above."
     fi
     critical_end
     [[ -n $tmp ]] && temp_umount "$tmp"
@@ -1857,37 +1907,37 @@ _shrink_restore_mount() {
         run mount "$mnt"
     else
         run mount "$part" "$mnt"
-    fi || warn "Impossibile rimontare $part su $mnt."
+    fi || warn "Could not mount $part on $mnt again."
 }
 
 wizard_create() {
-    local title="Crea partizione" disk sigs label_type regions=() items=() r s e k n primaries=0
+    local title="Create partition" disk sigs label_type regions=() items=() r s e k n primaries=0
     local ans fs fslabel maxlen part fsitems vgs_list=() v vg
-    disk=$(select_disk "$title" "Seleziona il disco su cui creare la partizione:") || return 0
+    disk=$(select_disk "$title" "Select the disk to create the partition on:") || return 0
 
     if ! load_table "$disk"; then
         if disk_in_use "$disk"; then
-            ui_msg "$title" "Il disco $disk non ha una tabella delle partizioni ma è in uso (montato, swap o LVM): impossibile continuare."
+            ui_msg "$title" "Disk $disk has no partition table but is in use (mounted, swap or LVM): cannot continue."
             return 0
         fi
         sigs=$(fs_type "$disk")
-        label_type=$(UI_NOTAGS=1 ui_menu "$title" "Il disco $disk non ha una tabella delle partizioni.\nScegli il tipo di tabella da creare:" \
-            gpt "GPT (consigliata: dischi moderni, UEFI, oltre 2 TiB)" \
-            dos "MBR/DOS (compatibilità con vecchi BIOS, max 2 TiB)") || return 0
+        label_type=$(UI_NOTAGS=1 ui_menu "$title" "Disk $disk has no partition table.\nChoose the type of table to create:" \
+            gpt "GPT (recommended: modern disks, UEFI, larger than 2 TiB)" \
+            dos "MBR/DOS (compatible with old BIOSes, max 2 TiB)") || return 0
         if [[ -n $sigs ]]; then
-            ui_confirm_typed "$title" "Il disco $disk contiene: $sigs.\nCreando una nuova tabella delle partizioni TUTTI I DATI DEL DISCO ANDRANNO PERSI." "$(basename "$disk")" || return 0
+            ui_confirm_typed "$title" "Disk $disk contains: $sigs.\nCreating a new partition table WILL DESTROY ALL THE DATA ON THE DISK." "$(basename "$disk")" || return 0
         else
-            ui_yesno "$title" "Creare una tabella delle partizioni $label_type vuota su $disk ($(human "$(dev_bytes "$disk")"))?" || return 0
+            ui_yesno "$title" "Create an empty $label_type partition table on $disk ($(human "$(dev_bytes "$disk")"))?" || return 0
         fi
         screen_start "$title"
         run_input "label: $label_type" sfdisk --wipe always "$disk" || { pause; return 0; }
         reread_table "$disk"
         pause_if_tui
         if (( PW_DRY_RUN )); then
-            ui_msg "$title" "Simulazione: la tabella non è stata creata davvero, quindi non posso proseguire con la creazione della partizione."
+            ui_msg "$title" "Dry run: the table was not really created, so the partition cannot be created either."
             return 0
         fi
-        load_table "$disk" || { ui_msg "$title" "Creazione della tabella non riuscita."; return 0; }
+        load_table "$disk" || { ui_msg "$title" "Creating the partition table failed."; return 0; }
     else
         screen_start "$title"
         prepare_disk_growth "$disk"
@@ -1897,44 +1947,44 @@ wizard_create() {
     if [[ $T_LABEL == dos ]]; then
         for k in "${T_NR[@]}"; do (( k <= 4 )) && primaries=$(( primaries + 1 )); done
         if (( primaries >= 4 )); then
-            ui_msg "$title" "Il disco $disk usa una tabella MBR e ha già 4 partizioni primarie (o estese): non è possibile crearne altre.\n\nConsiglio: elimina una partizione non necessaria oppure, se il disco è vuoto, ricrealo con tabella GPT."
+            ui_msg "$title" "Disk $disk uses an MBR table and already has 4 primary (or extended) partitions: no more can be created.\n\nTip: delete a partition you do not need or, if the disk is empty, recreate it with a GPT table."
             return 0
         fi
     fi
 
     mapfile -t regions < <(free_regions)
     if (( ${#regions[@]} == 0 )); then
-        ui_msg "$title" "Non c'è spazio non allocato su $disk.\n\nPuoi liberarne riducendo o eliminando una partizione."
+        ui_msg "$title" "There is no unallocated space on $disk.\n\nYou can free some by shrinking or deleting a partition."
         return 0
     fi
     n=1
     for r in "${regions[@]}"; do
         read -r s e <<<"$r"
-        items+=("$n" "$(human $(( (e - s + 1) * T_SS )))  libero (settori $s - $e)")
+        items+=("$n" "$(human $(( (e - s + 1) * T_SS )))  free (sectors $s - $e)")
         n=$(( n + 1 ))
     done
     if (( ${#regions[@]} == 1 )); then
         k=1
     else
-        k=$(ui_menu "$title" "Seleziona lo spazio libero da usare:" "${items[@]}") || return 0
+        k=$(ui_menu "$title" "Select the free space to use:" "${items[@]}") || return 0
     fi
     read -r s e <<<"${regions[k - 1]}"
 
     while :; do
-        ans=$(ui_input "$title" "Spazio libero selezionato: $(human $(( (e - s + 1) * T_SS )))\n\nDimensione della nuova partizione:\n  max  → tutto lo spazio libero\n  20G  → 20 GiB\n(unità accettate: M, G, T)" "max") || return 0
+        ans=$(ui_input "$title" "Selected free space: $(human $(( (e - s + 1) * T_SS )))\n\nSize of the new partition:\n  max  -> all the free space\n  20G  -> 20 GiB\n(accepted units: M, G, T)" "max") || return 0
         compute_end "$ans" "$s" "$s" "$e" create && break
         ui_msg "$title" "$SIZE_ERR"
     done
 
-    fsitems=(ext4 "ext4   — file system Linux (consigliato)"
-        xfs "xfs    — file system Linux per grandi volumi (non riducibile)"
-        btrfs "btrfs  — file system Linux con snapshot"
-        vfat "FAT32  — compatibile con Windows/macOS, chiavette, partizioni EFI"
-        ntfs "NTFS   — file system di Windows"
-        swap "swap   — area di scambio"
-        lvm "LVM    — volume fisico per LVM"
-        none "nessuno — crea solo la partizione")
-    fs=$(UI_NOTAGS=1 ui_menu "$title" "Come vuoi formattare la nuova partizione?" "${fsitems[@]}") || return 0
+    fsitems=(ext4 "ext4    - Linux file system (recommended)"
+        xfs "xfs     - Linux file system for large volumes (cannot be shrunk)"
+        btrfs "btrfs   - Linux file system with snapshots"
+        vfat "FAT32   - works with Windows/macOS, USB sticks, EFI partitions"
+        ntfs "NTFS    - Windows file system"
+        swap "swap    - swap space"
+        lvm "LVM     - LVM physical volume"
+        none "none    - only create the partition")
+    fs=$(UI_NOTAGS=1 ui_menu "$title" "How do you want to format the new partition?" "${fsitems[@]}") || return 0
 
     fslabel=""
     case $fs in
@@ -1946,28 +1996,28 @@ wizard_create() {
     esac
     if (( maxlen > 0 )); then
         while :; do
-            fslabel=$(ui_input "$title" "Etichetta (nome) del file system, massimo $maxlen caratteri.\nLascia vuoto per nessuna etichetta." "") || return 0
+            fslabel=$(ui_input "$title" "File system label (name), at most $maxlen characters.\nLeave it empty for no label." "") || return 0
             fslabel=$(trim "$fslabel")
             [[ $fs == vfat ]] && fslabel=${fslabel^^}
             if (( ${#fslabel} > maxlen )); then
-                ui_msg "$title" "Etichetta troppo lunga (massimo $maxlen caratteri)."
+                ui_msg "$title" "Label too long (at most $maxlen characters)."
                 continue
             fi
             if [[ $fslabel == *[\"\'\\]* ]]; then
-                ui_msg "$title" "L'etichetta non può contenere virgolette o barre rovesciate."
+                ui_msg "$title" "The label cannot contain quotes or backslashes."
                 continue
             fi
             break
         done
     fi
 
-    ui_yesno "$title" "Riepilogo dell'operazione:\n\n  Disco:        $disk (${T_LABEL^^})\n  Dimensione:   $(human $(( (NEW_END - s + 1) * T_SS )))\n  Settori:      $s - $NEW_END\n  File system:  $fs\n  Etichetta:    ${fslabel:-(nessuna)}\n\nLe partizioni esistenti non verranno modificate.\n\nProcedere?" || return 0
+    ui_yesno "$title" "Summary:\n\n  Disk:         $disk (${T_LABEL^^})\n  Size:         $(human $(( (NEW_END - s + 1) * T_SS )))\n  Sectors:      $s - $NEW_END\n  File system:  $fs\n  Label:        ${fslabel:-(none)}\n\nExisting partitions will not be changed.\n\nContinue?" || return 0
 
     screen_start "$title"
     critical_begin
     if ! op_create "$disk" "$s" "$NEW_END" "$fs" "$fslabel"; then
         critical_end
-        err "Creazione della partizione non riuscita."
+        err "Creating the partition failed."
         pause
         return 0
     fi
@@ -1984,13 +2034,13 @@ wizard_create() {
                 mapfile -t vgs_list < <(vgs --noheadings -o vg_name 2>/dev/null | awk 'NF { print $1 }')
                 if (( ${#vgs_list[@]} )); then
                     items=()
-                    for v in "${vgs_list[@]}"; do items+=("$v" "liberi $(human "$(vg_field "$v" vg_free)")"); done
-                    if vg=$(ui_menu "$title" "Vuoi aggiungere il nuovo volume fisico $part a un gruppo di volumi esistente?\n(Indietro = no)" "${items[@]}"); then
+                    for v in "${vgs_list[@]}"; do items+=("$v" "$(human "$(vg_field "$v" vg_free)") free"); done
+                    if vg=$(ui_menu "$title" "Add the new physical volume $part to an existing volume group?\n(Back = no)" "${items[@]}"); then
                         screen_start "$title"
                         if run vgextend "$vg" "$part"; then
-                            ok "$part aggiunta al gruppo di volumi $vg."
+                            ok "$part added to volume group $vg."
                             pause_if_tui
-                            ui_yesno "$title" "Vuoi assegnare subito il nuovo spazio a un volume logico?" && lvm_extend "$vg"
+                            ui_yesno "$title" "Assign the new space to a logical volume now?" && lvm_extend "$vg"
                         fi
                     fi
                 fi
@@ -2001,10 +2051,10 @@ wizard_create() {
 }
 
 wizard_delete() {
-    local title="Elimina partizione" disk part nr i t="" mnt="" is_ext=0 k swap_on=0
+    local title="Delete partition" disk part nr i t="" mnt="" is_ext=0 k swap_on=0
     local fstab_lines=() crypt_lines=() warnmsg="" wipe=1
-    disk=$(select_disk "$title" "Seleziona il disco che contiene la partizione da eliminare:") || return 0
-    part=$(select_partition "$disk" "$title" "Seleziona la partizione da ELIMINARE:" 1) || return 0
+    disk=$(select_disk "$title" "Select the disk holding the partition to delete:") || return 0
+    part=$(select_partition "$disk" "$title" "Select the partition to DELETE:" 1) || return 0
     nr=$(part_nr "$part")
     i=$(tbl_idx "$nr") || return 0
     is_extended_idx "$i" && is_ext=1
@@ -2012,57 +2062,57 @@ wizard_delete() {
     if (( is_ext )); then
         for k in "${T_NR[@]}"; do
             if (( k >= 5 )); then
-                ui_msg "$title" "La partizione estesa $part contiene ancora partizioni logiche: eliminale prima."
+                ui_msg "$title" "Extended partition $part still holds logical partitions: delete them first."
                 return 0
             fi
         done
-        t="partizione estesa (vuota)"
+        t="extended partition (empty)"
         wipe=0
     else
         t=$(fs_type "$part")
         mnt=$(mountpoint_of "$part")
         case $mnt in
             / | /boot | /boot/efi | /efi | /usr | /var | /home)
-                ui_msg "$title" "La partizione $part è montata su $mnt ed è usata dal sistema: non può essere eliminata."
+                ui_msg "$title" "Partition $part is mounted on $mnt and is used by the system: it cannot be deleted."
                 return 0
                 ;;
         esac
         if [[ -n $(dev_holders "$part") ]]; then
             if [[ $t == LVM2_member ]]; then
-                ui_msg "$title" "La partizione $part è un volume fisico LVM in uso ($(dev_child "$part")).\nRimuovila prima dal gruppo di volumi (pvmove + vgreduce)."
+                ui_msg "$title" "Partition $part is an LVM physical volume in use ($(dev_child "$part")).\nRemove it from its volume group first (pvmove + vgreduce)."
             else
-                ui_msg "$title" "La partizione $part è in uso da $(dev_child "$part") (es. volume cifrato aperto o RAID): chiudilo prima di eliminarla."
+                ui_msg "$title" "Partition $part is used by $(dev_child "$part") (e.g. an open encrypted volume or RAID): close it before deleting the partition."
             fi
             return 0
         fi
         swap_active "$part" && swap_on=1
-        [[ -n $mnt ]] && warnmsg+="\n• È montata su $mnt: verrà smontata."
-        (( swap_on )) && warnmsg+="\n• È una swap attiva: verrà disattivata."
+        [[ -n $mnt ]] && warnmsg+="\n * It is mounted on $mnt: it will be unmounted."
+        (( swap_on )) && warnmsg+="\n * It is an active swap: it will be turned off."
         mapfile -t fstab_lines < <(config_refs "$part" /etc/fstab 1)
         [[ $t == crypto_LUKS ]] && mapfile -t crypt_lines < <(config_refs "$part" /etc/crypttab 2)
-        (( ${#fstab_lines[@]} )) && warnmsg+="\n• È citata in /etc/fstab: le righe verranno commentate per evitare problemi all'avvio."
-        (( ${#crypt_lines[@]} )) && warnmsg+="\n• È citata in /etc/crypttab: le righe verranno commentate."
-        [[ $t == swap ]] && warnmsg+="\n• Se era usata per l'ibernazione, rimuovi anche il riferimento \"resume\" (es. /etc/initramfs-tools/conf.d/resume o i parametri del kernel)."
+        (( ${#fstab_lines[@]} )) && warnmsg+="\n * It is listed in /etc/fstab: those lines will be commented out to avoid boot problems."
+        (( ${#crypt_lines[@]} )) && warnmsg+="\n * It is listed in /etc/crypttab: those lines will be commented out."
+        [[ $t == swap ]] && warnmsg+="\n * If it was used for hibernation, also remove the \"resume\" reference (e.g. /etc/initramfs-tools/conf.d/resume or the kernel parameters)."
     fi
     if [[ $T_LABEL == dos ]] && (( nr >= 5 )); then
         for k in "${T_NR[@]}"; do
             if (( k > nr )); then
-                warnmsg+="\n• Le partizioni logiche successive verranno rinumerate (es. $(part_dev "$disk" "$k") → $(part_dev "$disk" $(( k - 1 ))))."
+                warnmsg+="\n * The following logical partitions will be renumbered (e.g. $(part_dev "$disk" "$k") -> $(part_dev "$disk" $(( k - 1 ))))."
                 break
             fi
         done
     fi
 
-    ui_confirm_typed "$title" "Stai per ELIMINARE la partizione $part ($(human $(( T_SIZE[i] * T_SS ))), contenuto: ${t:-sconosciuto}).\nTUTTI I DATI CHE CONTIENE ANDRANNO PERSI.$warnmsg" "$(basename "$part")" || return 0
+    ui_confirm_typed "$title" "You are about to DELETE partition $part ($(human $(( T_SIZE[i] * T_SS ))), contents: ${t:-unknown}).\nALL THE DATA ON IT WILL BE LOST.$warnmsg" "$(basename "$part")" || return 0
 
     screen_start "$title"
     if [[ -n $mnt ]] && ! run umount "$mnt"; then
-        err "Impossibile smontare $mnt: chiudi i programmi che lo stanno usando e riprova."
+        err "Could not unmount $mnt: close the programs using it and try again."
         pause
         return 0
     fi
     if (( swap_on )) && ! run swapoff "$part"; then
-        err "Impossibile disattivare la swap $part."
+        err "Could not turn off swap $part."
         pause
         return 0
     fi
@@ -2071,7 +2121,7 @@ wizard_delete() {
         (( ${#fstab_lines[@]} )) && comment_config_lines /etc/fstab "${fstab_lines[@]}" && systemd_reload
         (( ${#crypt_lines[@]} )) && comment_config_lines /etc/crypttab "${crypt_lines[@]}"
     else
-        err "Eliminazione non riuscita."
+        err "Deleting the partition failed."
     fi
     critical_end
     show_disk "$disk"
@@ -2079,54 +2129,54 @@ wizard_delete() {
 }
 
 wizard_rescan() {
-    local title="Rileva nuovo spazio" disk regions=() r s e
-    disk=$(select_disk "$title" "Seleziona il disco che hai ingrandito (ad esempio dal pannello di gestione della macchina virtuale):") || return 0
+    local title="Detect new space" disk regions=() r s e
+    disk=$(select_disk "$title" "Select the disk you enlarged (for example from the virtual machine settings):") || return 0
     screen_start "$title"
     prepare_disk_growth "$disk"
     printf '\n' >&2
     if load_table "$disk"; then
         mapfile -t regions < <(free_regions)
         if (( ${#regions[@]} == 0 )); then
-            info "Nessuno spazio non allocato su $disk ($(human "$(dev_bytes "$disk")"))."
+            info "No unallocated space on $disk ($(human "$(dev_bytes "$disk")"))."
         fi
         for r in "${regions[@]}"; do
             read -r s e <<<"$r"
-            info "Spazio non allocato su $disk: $(human $(( (e - s + 1) * T_SS ))) (settori $s - $e)"
+            info "Unallocated space on $disk: $(human $(( (e - s + 1) * T_SS ))) (sectors $s - $e)"
         done
-        info "Ora puoi usare \"Espandi una partizione\" o \"Crea una nuova partizione\"."
+        info "You can now use \"Grow a partition\" or \"Create a new partition\"."
     else
-        info "$disk: $(human "$(dev_bytes "$disk")"), nessuna tabella delle partizioni."
+        info "$disk: $(human "$(dev_bytes "$disk")"), no partition table."
     fi
     show_disk "$disk"
     pause
 }
 
 wizard_restore() {
-    local title="Ripristina tabella" files=() items=() f tag dev
+    local title="Restore partition table" files=() items=() f tag dev
     mapfile -t files < <(ls -1t "$PW_BACKUP_DIR"/*.sfdisk 2>/dev/null)
     if (( ${#files[@]} == 0 )); then
-        ui_msg "$title" "Nessun backup trovato in $PW_BACKUP_DIR."
+        ui_msg "$title" "No backups found in $PW_BACKUP_DIR."
         return 0
     fi
     for f in "${files[@]}"; do
         dev=$(awk -F': *' '/^device:/ { print $2; exit }' "$f")
-        items+=("$(basename "$f")" "disco ${dev:-?}")
+        items+=("$(basename "$f")" "disk ${dev:-?}")
     done
-    tag=$(ui_menu "$title" "Backup disponibili (dal più recente):" "${items[@]}") || return 0
+    tag=$(ui_menu "$title" "Available backups (newest first):" "${items[@]}") || return 0
     f="$PW_BACKUP_DIR/$tag"
     dev=$(awk -F': *' '/^device:/ { print $2; exit }' "$f")
     if [[ ! -b $dev ]]; then
-        ui_msg "$title" "Il disco $dev indicato nel backup non esiste."
+        ui_msg "$title" "Disk $dev named in the backup does not exist."
         return 0
     fi
     if disk_in_use "$dev"; then
-        ui_msg "$title" "Il disco $dev è in uso (partizioni montate, swap o LVM/LUKS attivi).\n\nPer sicurezza il ripristino è consentito solo su dischi non in uso: avvia da una live USB oppure smonta le partizioni.\n\nIn alternativa, manualmente:\n  sfdisk $dev < $f"
+        ui_msg "$title" "Disk $dev is in use (mounted partitions, swap or active LVM/LUKS).\n\nFor safety, a table can only be restored on a disk that is not in use: boot from a live USB or unmount the partitions.\n\nAlternatively, run manually:\n  sfdisk $dev < $f"
         return 0
     fi
-    ui_confirm_typed "$title" "La tabella delle partizioni di $dev verrà sostituita con:\n\n$(sed -n '/^\//p' "$f")\n\nI dati delle partizioni non vengono toccati, ma una tabella sbagliata può renderli inaccessibili." "$(basename "$dev")" || return 0
+    ui_confirm_typed "$title" "The partition table of $dev will be replaced with:\n\n$(sed -n '/^\//p' "$f")\n\nThe data inside the partitions is not touched, but a wrong table can make it unreachable." "$(basename "$dev")" || return 0
     screen_start "$title"
     backup_table "$dev"
-    run_input "$(<"$f")" sfdisk "$dev" && ok "Tabella ripristinata."
+    run_input "$(<"$f")" sfdisk "$dev" && ok "Partition table restored."
     reread_table "$dev"
     show_disk "$dev"
     pause
@@ -2134,24 +2184,24 @@ wizard_restore() {
 
 welcome() {
     local extra=""
-    (( PW_DRY_RUN )) && extra="\n\n*** MODALITÀ SIMULAZIONE: nessuna modifica verrà applicata ai dischi ***"
-    ui_msg "Partition Wizard $PW_VERSION" "Benvenuto! Questo wizard ti guida nell'espansione e nella modifica delle partizioni dei dischi.\n\nSistema: ${PW_DISTRO_NAME:-sconosciuto} (famiglia: ${PW_DISTRO:-sconosciuta})\n\nATTENZIONE: modificare le partizioni comporta sempre un rischio per i dati. Prima di continuare assicurati di avere un backup dei dati importanti.\n\n• Prima di ogni modifica la tabella delle partizioni viene salvata in $PW_BACKUP_DIR\n• Le operazioni vengono registrate in ${PW_LOG_FILE:-(registro disattivato)}$extra"
+    (( PW_DRY_RUN )) && extra="\n\n*** DRY-RUN MODE: no changes will be made to the disks ***"
+    ui_msg "Partition Wizard $PW_VERSION" "Welcome! This wizard guides you through growing and modifying disk partitions.\n\nSystem: ${PW_DISTRO_NAME:-unknown} (family: ${PW_DISTRO:-unknown})\n\nWARNING: changing partitions always puts data at risk. Before continuing, make sure you have a backup of your important data.\n\n * Before every change the partition table is saved in $PW_BACKUP_DIR\n * Operations are logged to ${PW_LOG_FILE:-(logging disabled)}$extra"
 }
 
 main_menu() {
     local choice title="Partition Wizard $PW_VERSION"
-    (( PW_DRY_RUN )) && title+=" [SIMULAZIONE]"
+    (( PW_DRY_RUN )) && title+=" [DRY RUN]"
     while :; do
-        choice=$(UI_CANCEL="Esci" ui_menu "$title" "Cosa vuoi fare?" \
-            1 "Visualizza dischi, partizioni e spazio libero" \
-            2 "Espandi una partizione (e il suo file system)" \
-            3 "Riduci una partizione" \
-            4 "Crea una nuova partizione" \
-            5 "Elimina una partizione" \
-            6 "Gestisci LVM (volumi logici)" \
-            7 "Rileva il nuovo spazio di un disco ingrandito" \
-            8 "Ripristina una tabella delle partizioni da backup" \
-            9 "Esci") || choice=9
+        choice=$(UI_CANCEL="Exit" ui_menu "$title" "What do you want to do?" \
+            1 "Show disks, partitions and free space" \
+            2 "Grow a partition (and its file system)" \
+            3 "Shrink a partition" \
+            4 "Create a new partition" \
+            5 "Delete a partition" \
+            6 "Manage LVM (logical volumes)" \
+            7 "Detect new space on an enlarged disk" \
+            8 "Restore a partition table from a backup" \
+            9 "Exit") || choice=9
         case $choice in
             1) show_overview ;;
             2) wizard_expand ;;
@@ -2165,35 +2215,35 @@ main_menu() {
         esac
     done
     [[ $PW_UI == whiptail && -t 1 ]] && clear
-    info "Arrivederci!"
+    info "Goodbye!"
 }
 
 # -----------------------------------------------------------------------------
-# Avvio
+# Startup
 # -----------------------------------------------------------------------------
 
 usage() {
     cat <<EOF
 Partition Wizard $PW_VERSION
-Wizard interattivo per espandere, ridurre, creare ed eliminare partizioni su
-distribuzioni basate su Debian (apt) o Fedora/RHEL (dnf).
+Interactive wizard to grow, shrink, create and delete partitions on
+Debian-based (apt) and Fedora/RHEL-based (dnf) distributions.
 
-Uso: partition-wizard.sh [opzioni]
+Usage: partition-wizard.sh [options]
 
-Opzioni:
-  -n, --dry-run        simulazione: mostra i comandi senza modificare nulla
-  -t, --text           interfaccia testuale semplice (senza whiptail)
-  -d, --distro NOME    forza la famiglia di distribuzione: debian | fedora
-  -l, --list           mostra dischi, partizioni e spazio libero ed esce
-      --install-deps   installa tutti gli strumenti necessari ed esce
-  -y, --yes            installa le dipendenze senza chiedere conferma
-      --include-loop   mostra anche i dispositivi loop (prove su file immagine)
-  -h, --help           mostra questo aiuto
-  -V, --version        mostra la versione
+Options:
+  -n, --dry-run        simulation: show the commands without changing anything
+  -t, --text           plain text interface (no whiptail)
+  -d, --distro NAME    force the distribution family: debian | fedora
+  -l, --list           show disks, partitions and free space, then exit
+      --install-deps   install all the required tools, then exit
+  -y, --yes            install dependencies without asking for confirmation
+      --include-loop   also show loop devices (for tests on image files)
+  -h, --help           show this help
+  -V, --version        show the version
 
-Esempi:
-  curl -fsSL $PW_RAW_URL | sudo bash
-  curl -fsSL $PW_RAW_URL | sudo bash -s -- --dry-run
+Examples:
+  $PW_RUN_CMD
+  $PW_RUN_CMD partition-wizard --dry-run
   sudo ./partition-wizard.sh --distro fedora
 EOF
 }
@@ -2208,7 +2258,7 @@ parse_args() {
                 case ${1:-} in
                     debian | ubuntu) PW_DISTRO="debian" ;;
                     fedora | rhel | centos) PW_DISTRO="fedora" ;;
-                    *) die "Valore non valido per --distro: '${1:-}' (usa debian oppure fedora)." ;;
+                    *) die "Invalid value for --distro: '${1:-}' (use debian or fedora)." ;;
                 esac
                 ;;
             --distro=*)
@@ -2221,7 +2271,7 @@ parse_args() {
             --include-loop) PW_INCLUDE_LOOP=1 ;;
             -h | --help) PW_MODE="help" ;;
             -V | --version) PW_MODE="version" ;;
-            *) die "Opzione sconosciuta: $1 (usa --help)" ;;
+            *) die "Unknown option: $1 (see --help)" ;;
         esac
         shift
     done
@@ -2230,27 +2280,27 @@ parse_args() {
 require_root() {
     (( EUID == 0 )) && return 0
     if [[ -n $PW_SELF && -f $PW_SELF ]] && command -v sudo >/dev/null 2>&1; then
-        info "Servono i privilegi di amministratore: riavvio con sudo..."
+        info "Administrator privileges are required: restarting with sudo..."
         exec sudo -- bash "$PW_SELF" "${PW_ARGS[@]}"
     fi
-    die "Questo script deve essere eseguito come root, ad esempio: curl -fsSL $PW_RAW_URL | sudo bash"
+    die "This script must be run as root, for example: $PW_RUN_CMD"
 }
 
 init_log() {
     if ! { mkdir -p "$(dirname "$PW_LOG_FILE")" && touch "$PW_LOG_FILE"; } 2>/dev/null; then
         PW_LOG_FILE=""
     fi
-    log "===== partition-wizard $PW_VERSION avviato (modo=$PW_MODE simulazione=$PW_DRY_RUN) ====="
+    log "===== partition-wizard $PW_VERSION started (mode=$PW_MODE dry-run=$PW_DRY_RUN) ====="
 }
 
 choose_distro() {
     [[ -n $PW_DISTRO ]] && return 0
     local c
-    c=$(ui_menu "Distribuzione" "Non riesco a riconoscere la distribuzione (${PW_DISTRO_NAME:-sconosciuta}).\nScegli il gestore di pacchetti da usare per installare gli strumenti mancanti:" \
-        debian "Basata su Debian/Ubuntu (apt)" \
-        fedora "Basata su Fedora/RHEL (dnf)") || c=""
+    c=$(ui_menu "Distribution" "The distribution could not be recognised (${PW_DISTRO_NAME:-unknown}).\nChoose the package manager to use for installing missing tools:" \
+        debian "Debian/Ubuntu based (apt)" \
+        fedora "Fedora/RHEL based (dnf)") || c=""
     PW_DISTRO=$c
-    [[ -n $PW_DISTRO ]] || warn "Nessun gestore di pacchetti: gli strumenti mancanti andranno installati a mano."
+    [[ -n $PW_DISTRO ]] || warn "No package manager selected: missing tools will have to be installed manually."
 }
 
 main() {
@@ -2282,17 +2332,22 @@ main() {
             ;;
     esac
 
-    # Il wizard ha bisogno di un terminale: se lo script arriva da una pipe
-    # (curl | bash) lo standard input viene ricollegato al terminale.
+    # The wizard needs a terminal: when the script arrives through a pipe
+    # (curl | bash) standard input is reconnected to the terminal, unless
+    # sudo makes the keyboard unreachable (see keyboard_unreachable).
     if [[ ! -t 0 ]]; then
-        { exec 0</dev/tty; } 2>/dev/null || die "Serve un terminale interattivo per usare il wizard."
+        if keyboard_unreachable; then
+            pipe_hint
+            exit 1
+        fi
+        { exec 0</dev/tty; } 2>/dev/null || die "An interactive terminal is required to use the wizard."
     fi
 
     choose_distro
-    ensure_cmds "${PW_CORE_CMDS[@]}" || die "Impossibile continuare senza gli strumenti di base."
+    ensure_cmds "${PW_CORE_CMDS[@]}" || die "Cannot continue without the core tools."
     if (( ! PW_NO_TUI )) && ! command -v whiptail >/dev/null 2>&1 && [[ -n $PW_DISTRO ]] && (( ! PW_DRY_RUN )); then
-        if ui_yesno "Interfaccia" "Per un'interfaccia più comoda (menu e finestre) posso installare whiptail.\nVuoi installarlo? (Altrimenti verrà usata l'interfaccia testuale semplice.)"; then
-            install_pkgs "$(pkg_for_cmd whiptail)" || warn "Installazione di whiptail non riuscita: uso l'interfaccia testuale."
+        if ui_yesno "Interface" "whiptail can be installed for a friendlier interface (menus and dialog boxes).\nInstall it? (Otherwise the plain text interface is used.)"; then
+            install_pkgs "$(pkg_for_cmd whiptail)" || warn "Installing whiptail failed: using the text interface."
         fi
     fi
     init_sfdisk_opts || exit 1
@@ -2301,6 +2356,6 @@ main() {
     main_menu
 }
 
-# Con PW_NO_MAIN=1 lo script può essere incluso (source) senza avviare il
-# wizard, ad esempio dai test automatici.
+# With PW_NO_MAIN=1 the script can be sourced without starting the wizard,
+# for example by the automated tests.
 [[ -n ${PW_NO_MAIN:-} ]] || { main "$@"; exit $?; }
