@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Analisi statica
+        env:
+          LANG: C.UTF-8
+        run: shellcheck -x partition-wizard.sh tests/run-tests.sh
+      - name: Sintassi e aiuto
+        run: |
+          bash -n partition-wizard.sh
+          ./partition-wizard.sh --help
+          ./partition-wizard.sh --version
+
+  integration:
+    name: Test su dischi virtuali (Ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installazione dipendenze tramite lo script
+        run: sudo ./partition-wizard.sh --install-deps --yes
+      - name: Test (dispositivi loop)
+        run: sudo tests/run-tests.sh
+
+  dependencies:
+    name: Dipendenze su ${{ matrix.image }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:stable
+            check: full
+          - image: debian:oldstable
+            check: full
+          - image: ubuntu:24.04
+            check: full
+          - image: fedora:latest
+            check: full
+          - image: rockylinux:9
+            check: core
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installazione e verifica in un container
+        run: |
+          docker run --rm -v "$PWD:/src:ro" -e CHECK=${{ matrix.check }} ${{ matrix.image }} bash -c '
+            set -e
+            export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+            /src/partition-wizard.sh --install-deps --yes
+            core="sfdisk partx lsblk blkid findmnt wipefs blockdev awk"
+            full="$core whiptail resize2fs xfs_growfs btrfs pvresize cryptsetup mkfs.vfat ntfsresize mkfs.ntfs"
+            [ "$CHECK" = full ] && cmds=$full || cmds=$core
+            for c in $cmds; do
+              command -v "$c" >/dev/null || { echo "Comando mancante: $c"; exit 1; }
+            done
+            echo "Tutti i comandi sono disponibili."
+          '
