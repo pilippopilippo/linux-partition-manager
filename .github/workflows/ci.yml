@@ -9,29 +9,29 @@ jobs:
     name: ShellCheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Analisi statica
+      - uses: actions/checkout@v5
+      - name: Static analysis
         env:
           LANG: C.UTF-8
         run: shellcheck -x partition-wizard.sh tests/run-tests.sh
-      - name: Sintassi e aiuto
+      - name: Syntax and help
         run: |
           bash -n partition-wizard.sh
           ./partition-wizard.sh --help
           ./partition-wizard.sh --version
 
   integration:
-    name: Test su dischi virtuali (Ubuntu)
+    name: Tests on virtual disks (Ubuntu)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Installazione dipendenze tramite lo script
+      - uses: actions/checkout@v5
+      - name: Install dependencies with the script
         run: sudo ./partition-wizard.sh --install-deps --yes
-      - name: Test (dispositivi loop)
+      - name: Tests (loop devices)
         run: sudo tests/run-tests.sh
 
   dependencies:
-    name: Dipendenze su ${{ matrix.image }}
+    name: Dependencies on ${{ matrix.image }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -48,8 +48,8 @@ jobs:
           - image: rockylinux:9
             check: core
     steps:
-      - uses: actions/checkout@v4
-      - name: Installazione e verifica in un container
+      - uses: actions/checkout@v5
+      - name: Install and verify inside a container
         run: |
           docker run --rm -v "$PWD:/src:ro" -e CHECK=${{ matrix.check }} ${{ matrix.image }} bash -c '
             set -e
@@ -59,7 +59,7 @@ jobs:
             full="$core whiptail resize2fs xfs_growfs btrfs pvresize cryptsetup mkfs.vfat ntfsresize mkfs.ntfs"
             [ "$CHECK" = full ] && cmds=$full || cmds=$core
             for c in $cmds; do
-              command -v "$c" >/dev/null || { echo "Comando mancante: $c"; exit 1; }
+              command -v "$c" >/dev/null || { echo "Missing command: $c"; exit 1; }
             done
-            echo "Tutti i comandi sono disponibili."
+            echo "All commands are available."
           '
