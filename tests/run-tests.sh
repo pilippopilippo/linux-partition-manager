@@ -497,7 +497,7 @@ test_vfat() {
 
 test_luks() {
     echo "== LUKS"
-    local d p nr
+    local d p nr before
     if ! command -v cryptsetup >/dev/null || ! dmsetup version >/dev/null 2>&1; then
         skip "cryptsetup/device-mapper not available"
         return
@@ -512,12 +512,16 @@ test_luks() {
         return
     fi
     mkfs.ext4 -q /dev/mapper/pwtestcrypt
+    before=$(dev_bytes /dev/mapper/pwtestcrypt)
     nr=$(part_nr "$p")
     set_part_end "$d" "$nr" "$(end_for_size "$d" "$nr" 256)" >/dev/null 2>&1
     # cryptsetup may ask for the passphrase to resize a LUKS2 volume
     grow_contents "$p" >/dev/null 2>&1 <<<"pw-test-secret"
-    check "LUKS mapping grown" test "$(dev_bytes /dev/mapper/pwtestcrypt)" -gt "$(mib 240)"
-    check "file system inside LUKS grown" fills "$(dev_bytes /dev/mapper/pwtestcrypt)" "$(ext_bytes /dev/mapper/pwtestcrypt)"
+    # the partition grew by 128 MiB, so the mapping must grow by the same amount
+    # (the LUKS header size does not change)
+    check_eq "LUKS mapping grown by 128 MiB" $(( before + $(mib 128) )) "$(dev_bytes /dev/mapper/pwtestcrypt)"
+    check "file system inside LUKS grown" test "$(ext_bytes /dev/mapper/pwtestcrypt)" -gt "$before"
+    check "file system fills the LUKS mapping" fills "$(dev_bytes /dev/mapper/pwtestcrypt)" "$(ext_bytes /dev/mapper/pwtestcrypt)"
     cryptsetup close pwtestcrypt
 }
 
