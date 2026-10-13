@@ -20,7 +20,7 @@
 
 set -o pipefail
 
-PW_VERSION="1.1.0"
+PW_VERSION="1.2.0"
 PW_REPO="pilippopilippo/linux-partition-manager"
 PW_RAW_URL="https://raw.githubusercontent.com/${PW_REPO}/main/partition-wizard.sh"
 PW_RUN_CMD="sudo bash -c \"\$(curl -fsSL $PW_RAW_URL)\""
@@ -212,6 +212,35 @@ mountpoint_of() {
     m=$(findmnt -ln -o TARGET --source "$1" 2>/dev/null | head -n1)
     trim "$m"
 }
+
+# All the places where DEV is mounted (bind mounts, btrfs subvolumes ...)
+mountpoints_of() {
+    local m
+    while IFS= read -r m; do
+        m=$(trim "$m")
+        [[ -n $m ]] && printf '%s\n' "$m"
+    done < <(findmnt -ln -o TARGET --source "$1" 2>/dev/null)
+}
+
+# Unmounts every mount point of DEV; fails if it is still mounted afterwards
+unmount_all() {
+    local m mnts=()
+    mapfile -t mnts < <(mountpoints_of "$1" | sort -r)
+    for m in "${mnts[@]}"; do
+        run umount "$m" || return 1
+    done
+    (( PW_DRY_RUN )) || [[ -z $(mountpoint_of "$1") ]]
+}
+
+# Signatures found on a device (file systems, partition tables, RAID, LVM ...)
+dev_signatures() {
+    local s
+    s=$(wipefs -n -O TYPE --noheadings "$1" 2>/dev/null | awk 'NF && !seen[$1]++ { print $1 }' | paste -sd, -)
+    [[ -n $s ]] || s=$(fs_type "$1")
+    printf '%s' "$s"
+}
+
+clear_screen() { clear 2>/dev/null || printf '\033[H\033[2J'; }
 
 swap_active() {
     local d n
@@ -514,7 +543,7 @@ ui_fmt() { printf '%s' "${1//\\n/$'\n'}"; }
 ui_header() { printf '\n%s=== %s ===%s\n' "$C_BOLD" "$1" "$C_RESET" >&2; }
 
 screen_start() {
-    [[ $PW_UI == whiptail && -t 1 ]] && clear
+    [[ $PW_UI == whiptail && -t 1 ]] && clear_screen
     ui_header "$1"
 }
 
@@ -574,22 +603,28 @@ ui_yesno() {
     done
 }
 
-# ui_input TITLE TEXT [DEFAULT] -> prints the value entered
+# ui_input TITLE TEXT [DEFAULT] -> prints the value entered.
+# The field starts empty (a pre-filled value would be extended rather than
+# replaced by what the user types); an empty answer means DEFAULT.
 ui_input() {
-    local title=$1 text def=${3:-} h val
+    local title=$1 text def=${3:-} h val rc
     text=$(ui_fmt "$2")
+    [[ -n $def ]] && text+=$'\n\n'"(Press Enter for: $def)"
     if [[ $PW_UI == whiptail ]]; then
         ui_size
         h=$(( $(ui_lines "$text") + 8 ))
         (( h > UI_HMAX )) && h=$UI_HMAX
-        whiptail --title "$title" --ok-button "OK" --cancel-button "Cancel" \
-            --inputbox "$text" "$h" "$UI_W" "$def" 3>&1 1>&2 2>&3
-        return
+        val=$(whiptail --title "$title" --ok-button "OK" --cancel-button "Cancel" \
+            --inputbox "$text" "$h" "$UI_W" "" 3>&1 1>&2 2>&3)
+        rc=$?
+        (( rc == 0 )) || return "$rc"
+    else
+        ui_header "$title"
+        printf '%s\n' "$text" >&2
+        read -r -e -p "> " val || return 1
     fi
-    ui_header "$title"
-    printf '%s\n' "$text" >&2
-    read -r -e -i "$def" -p "> " val || return 1
-    printf '%s\n' "$val"
+    val=$(trim "$val")
+    printf '%s\n' "${val:-$def}"
 }
 
 # ui_menu TITLE TEXT tag1 item1 [tag2 item2 ...] -> prints the selected tag
@@ -657,15 +692,21 @@ ui_confirm_typed() {
 #   T_LABEL  gpt | dos      T_SS     logical sector size (bytes)
 #   T_TOTAL  total sectors  T_FIRST/T_LAST first/last usable sector
 #   T_NR[] T_START[] T_SIZE[] T_TYPE[]  partitions (logical sectors)
+#   T_ERR    reason when load_table fails (no table / unsupported table)
+# Returns 1 when the disk has no partition table, 2 when its table type is
+# not supported (only GPT and MBR/DOS are).
 
 load_table() {
     local disk=$1 dump line
-    T_LABEL="" T_FIRST=0 T_LAST=0
+    T_LABEL="" T_FIRST=0 T_LAST=0 T_ERR=""
     T_NR=() T_START=() T_SIZE=() T_TYPE=()
     T_SS=$(blockdev --getss "$disk" 2>/dev/null) || T_SS=512
     [[ $T_SS =~ ^[0-9]+$ ]] || T_SS=512
     T_TOTAL=$(( $(dev_bytes "$disk") / T_SS ))
-    dump=$(LC_ALL=C sfdisk --dump "$disk" 2>/dev/null) || return 1
+    if ! dump=$(LC_ALL=C sfdisk --dump "$disk" 2>/dev/null); then
+        T_ERR="Disk $disk has no partition table."
+        return 1
+    fi
     while IFS= read -r line; do
         case $line in
             label:*) T_LABEL=$(trim "${line#label:}") ;;
@@ -692,8 +733,16 @@ load_table() {
             (( T_FIRST > 0 )) || T_FIRST=34
             (( T_LAST > 0 )) || T_LAST=$(( T_TOTAL - 34 ))
             ;;
+        "")
+            T_ERR="Disk $disk has no partition table."
+            return 1
+            ;;
+        *)
+            T_ERR="Disk $disk uses a \"$T_LABEL\" partition table, which this wizard does not support (only GPT and MBR)."
+            return 2
+            ;;
     esac
-    [[ -n $T_LABEL ]]
+    return 0
 }
 
 tbl_idx() {
@@ -864,7 +913,7 @@ part_desc() {
 select_partition() {
     local disk=$1 title=$2 text=$3 with_ext=${4:-0} i dev items=()
     if ! load_table "$disk"; then
-        ui_msg "$title" "Disk $disk has no partition table."
+        ui_msg "$title" "$T_ERR"
         return 1
     fi
     for i in "${!T_NR[@]}"; do
@@ -891,8 +940,13 @@ show_disk() {
 # -----------------------------------------------------------------------------
 
 backup_table() {
-    local disk=$1 f
-    f="$PW_BACKUP_DIR/$(kname "$disk")-$(date +%Y%m%d-%H%M%S).sfdisk"
+    local disk=$1 base f n=1
+    base="$PW_BACKUP_DIR/$(kname "$disk")-$(date +%Y%m%d-%H%M%S)"
+    f="$base.sfdisk"
+    while [[ -e $f ]]; do
+        f="$base-$n.sfdisk"
+        n=$(( n + 1 ))
+    done
     if (( PW_DRY_RUN )); then
         printf '%s[dry-run]%s partition table backup to %s\n' "$C_YELLOW" "$C_RESET" "$f" >&2
         return 0
@@ -908,15 +962,53 @@ backup_table() {
     return 0
 }
 
-# Tells the kernel about partition table changes
+# Kernel partitions of DISK: prints "number start size" (512-byte units)
+kernel_parts() {
+    local dn p
+    dn=$(kname "$1")
+    for p in /sys/class/block/"$dn"/"$dn"*; do
+        [[ -r $p/partition && -r $p/start && -r $p/size ]] || continue
+        printf '%s %s %s\n' "$(<"$p/partition")" "$(<"$p/start")" "$(<"$p/size")"
+    done
+}
+
+# True when the kernel sees exactly the partitions of the table on disk
+kernel_in_sync() {
+    local disk=$1 nr kstart ksize i n=0
+    load_table "$disk" || return 0
+    while read -r nr kstart ksize; do
+        i=$(tbl_idx "$nr") || return 1
+        (( kstart == T_START[i] * T_SS / 512 )) || return 1
+        is_extended_idx "$i" || (( ksize == T_SIZE[i] * T_SS / 512 )) || return 1
+        n=$(( n + 1 ))
+    done < <(kernel_parts "$disk")
+    (( n == ${#T_NR[@]} ))
+}
+
+# Tells the kernel about partition table changes. Kernel partitions that no
+# longer exist, or that now start elsewhere (e.g. logical partitions that were
+# renumbered), are removed first so that they can be added again correctly;
+# partitions in use cannot be removed and keep their old layout until reboot.
+# With "quiet" as second argument no warning is printed if that happens.
 reread_table() {
-    local disk=$1
+    local disk=$1 quiet=${2:-} nr kstart i
     (( PW_DRY_RUN )) && return 0
     sync
+    if load_table "$disk"; then
+        while read -r nr kstart _; do
+            if ! i=$(tbl_idx "$nr") || (( T_START[i] * T_SS / 512 != kstart )); then
+                partx -d --nr "$nr" "$disk" >/dev/null 2>&1
+            fi
+        done < <(kernel_parts "$disk")
+    fi
     partx -u "$disk" >/dev/null 2>&1
     partx -a "$disk" >/dev/null 2>&1
     if command -v udevadm >/dev/null 2>&1; then
         udevadm settle --timeout=15 >/dev/null 2>&1
+    fi
+    if ! kernel_in_sync "$disk"; then
+        [[ -n $quiet ]] || warn "The kernel still uses the old layout for some partitions of $disk (probably because they are in use). Reboot before making further changes to this disk."
+        return 1
     fi
     return 0
 }
@@ -994,7 +1086,7 @@ set_part_end() {
         done
     fi
     run_input ", $(( new_end - start + 1 ))" sfdisk "${SFDISK_OPTS[@]}" -N "$nr" "$disk" || return 1
-    reread_table "$disk"
+    reread_table "$disk" quiet
     (( PW_DRY_RUN )) && return 0
     part=$(part_dev "$disk" "$nr")
     expected=$(( (new_end - start + 1) * T_SS ))
@@ -1007,10 +1099,11 @@ set_part_end() {
     ok "Partition $part is now $(human "$expected")."
 }
 
-temp_mount() {
+temp_mount() {   # device [mount options...]
     local dev=$1 d
+    shift
     d=$(mktemp -d /tmp/partition-wizard.XXXXXX) || return 1
-    if ! run mount "$dev" "$d"; then
+    if ! run mount "$@" "$dev" "$d"; then
         rmdir "$d" 2>/dev/null
         return 1
     fi
@@ -1069,7 +1162,8 @@ grow_fs() {
             ensure_cmds xfs_growfs || return 1
             mnt=$(mountpoint_of "$dev")
             if [[ -z $mnt ]]; then
-                temp_mount "$dev" || return 1
+                # nouuid: also works for a copy of a file system that is mounted
+                temp_mount "$dev" -o nouuid || return 1
                 mnt=$PW_LAST_MNT tmp=$PW_LAST_MNT
             fi
             run xfs_growfs "$mnt" || rc=$?
@@ -1129,7 +1223,7 @@ grow_luks() {
     fi
     ensure_cmds cryptsetup || return 1
     info "Resizing encrypted volume $mapper (the passphrase may be requested)."
-    run cryptsetup resize "$mapper" || { err "cryptsetup resize failed."; return 1; }
+    run cryptsetup resize "${mapper##*/}" || { err "cryptsetup resize failed."; return 1; }
     ok "Encrypted volume $mapper grown."
     grow_contents "$mapper"
 }
@@ -1302,11 +1396,12 @@ op_create() {
     CREATED_PART=$part
     [[ $fs == none ]] && return 0
     run wipefs -a "$part" >/dev/null
-    make_fs "$part" "$fs" "$label"
+    make_fs "$part" "$fs" "$label" $(( (end - start + 1) * T_SS ))
 }
 
-make_fs() {
-    local dev=$1 fs=$2 label=$3 args=()
+make_fs() {   # device fs label [size_bytes]
+    local dev=$1 fs=$2 label=$3 bytes=${4:-} args=()
+    [[ -n $bytes ]] || bytes=$(dev_bytes "$dev")
     case $fs in
         ext4)
             ensure_cmds mkfs.ext4 || return 1
@@ -1326,7 +1421,9 @@ make_fs() {
         vfat)
             ensure_cmds mkfs.vfat || return 1
             [[ -n $label ]] && args+=(-n "$label")
-            run mkfs.vfat -F 32 "${args[@]}" "$dev"
+            # FAT32 needs enough clusters: smaller partitions get FAT16/FAT12
+            (( bytes >= 64 * MIB )) && args+=(-F 32)
+            run mkfs.vfat "${args[@]}" "$dev"
             ;;
         ntfs)
             ensure_cmds mkfs.ntfs || return 1
@@ -1348,6 +1445,10 @@ make_fs() {
 op_delete() {
     local disk=$1 nr=$2 wipe=$3 part
     part=$(part_dev "$disk" "$nr")
+    if (( ! PW_DRY_RUN )) && [[ -b $part ]] && dev_in_use "$part"; then
+        err "Partition $part is still in use (mounted, active swap or used by LVM/LUKS): not deleted."
+        return 1
+    fi
     backup_table "$disk"
     if (( wipe )) && [[ -b $part ]]; then
         run wipefs -a "$part" || warn "wipefs failed: continuing anyway."
@@ -1395,6 +1496,11 @@ systemd_reload() {
     return 0
 }
 
+# Absolute path, not "/", without characters that would need escaping in fstab
+valid_mount_point() {
+    [[ $1 =~ ^/[A-Za-z0-9._@:+/-]+$ && $1 != *//* && $1 != */../* && $1 != */.. ]]
+}
+
 # Adds the new partition to /etc/fstab and mounts it
 setup_mount() {
     local dev=$1 t=$2 mnt uuid pass=2 line bak
@@ -1402,8 +1508,8 @@ setup_mount() {
         mnt=$(ui_input "Automatic mount" "Mount the new partition $dev automatically at boot?\n\nEnter the mount point (e.g. /mnt/data or /srv/backup)\nor leave it empty to skip mounting." "") || return 0
         mnt=$(trim "$mnt")
         [[ -z $mnt ]] && return 0
-        if [[ $mnt != /* || $mnt == *[[:space:]]* || $mnt == / ]]; then
-            ui_msg "Automatic mount" "Invalid path: it must be absolute and contain no spaces."
+        if ! valid_mount_point "$mnt"; then
+            ui_msg "Automatic mount" "Invalid path: it must be absolute, not \"/\", and use only letters, digits and . _ - + @ :"
             continue
         fi
         if findmnt -n "$mnt" >/dev/null 2>&1; then
@@ -1650,14 +1756,14 @@ wizard_lvm() {
 show_overview() {
     local d s e args=(-o "NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT") regions=() r gap
     (( PW_INCLUDE_LOOP )) || args+=(-e 7)
-    [[ $PW_UI == whiptail && -t 1 ]] && clear
+    [[ $PW_UI == whiptail && -t 1 ]] && clear_screen
     ui_header "Disks and partitions"
     lsblk "${args[@]}" >&2
     ui_header "Unallocated space"
     for d in $(list_disks); do
         if ! load_table "$d"; then
-            printf '%s (%s): no partition table%s\n' "$d" "$(human "$(dev_bytes "$d")")" \
-                "$(t=$(fs_type "$d"); [[ -n $t ]] && printf ', directly contains %s' "$t")" >&2
+            printf '%s (%s): %s%s\n' "$d" "$(human "$(dev_bytes "$d")")" "$T_ERR" \
+                "$(t=$(dev_signatures "$d"); [[ -n $t ]] && printf ' Signatures found: %s.' "$t")" >&2
             continue
         fi
         printf '%s (%s, %s):\n' "$d" "$(human "$(dev_bytes "$d")")" "${T_LABEL^^}" >&2
@@ -1685,13 +1791,19 @@ show_overview() {
 }
 
 wizard_expand() {
-    local title="Grow partition" disk part nr i start cur_end max_end free t mnt ans cur new_size j next=""
+    local title="Grow partition" disk part nr i start cur_end max_end free t mnt ans cur new_size j next="" rc
     disk=$(select_disk "$title" "Select the disk holding the partition to grow:") || return 0
     screen_start "$title"
     prepare_disk_growth "$disk"
     (( PW_DISK_CHANGED )) && pause_if_tui
 
-    if ! load_table "$disk"; then
+    load_table "$disk"
+    rc=$?
+    if (( rc == 2 )); then
+        ui_msg "$title" "$T_ERR"
+        return 0
+    fi
+    if (( rc != 0 )); then
         t=$(fs_type "$disk")
         if [[ -n $t ]]; then
             if ui_yesno "$title" "Disk $disk has no partitions but directly contains: $t.\n\nGrow its contents to fill the whole disk ($(human "$(dev_bytes "$disk")"))?"; then
@@ -1702,6 +1814,8 @@ wizard_expand() {
                 show_disk "$disk"
                 pause
             fi
+        elif [[ -n $(dev_signatures "$disk") ]]; then
+            ui_msg "$title" "Disk $disk has no supported partition table or file system (signatures found: $(dev_signatures "$disk"))."
         else
             ui_msg "$title" "Disk $disk contains neither a partition table nor a file system.\nUse \"Create a new partition\"."
         fi
@@ -1811,6 +1925,10 @@ wizard_shrink() {
     # ext2/3/4 and NTFS can only be shrunk while unmounted; btrfs also mounted.
     mnt=$(mountpoint_of "$part")
     if [[ -n $mnt && $t != btrfs && $t != swap ]]; then
+        if (( $(mountpoints_of "$part" | wc -l) > 1 )); then
+            ui_msg "$title" "Partition $part is mounted in several places:\n$(mountpoints_of "$part")\n\nUnmount it everywhere and try again."
+            return 0
+        fi
         if [[ $mnt == / || $mnt == /usr || $mnt == /var || $mnt == /boot ]]; then
             ui_msg "$title" "Partition $part is mounted on $mnt and is needed by the running system: it cannot be unmounted.\n\nTo shrink it, boot the computer from a live USB (e.g. Ubuntu or Fedora live) and run this script from there."
             return 0
@@ -1851,7 +1969,11 @@ wizard_shrink() {
     esac
     if ! min=$(fs_min_bytes "$part" "$t" "$mnt" "$devid"); then
         pause_if_tui
-        ui_msg "$title" "Could not determine the minimum size required by the file system on $part."
+        if [[ $t == ntfs ]]; then
+            ui_msg "$title" "Could not determine the minimum size of the NTFS file system on $part.\n\nMake sure Windows was shut down completely (disable Fast Startup and hibernation) and, if needed, run \"chkdsk /f\" from Windows."
+        else
+            ui_msg "$title" "Could not determine the minimum size required by the file system on $part."
+        fi
         [[ -n $tmp ]] && temp_umount "$tmp"
         _shrink_restore_mount "$part" "$unmounted"
         return 0
@@ -1912,15 +2034,21 @@ _shrink_restore_mount() {
 
 wizard_create() {
     local title="Create partition" disk sigs label_type regions=() items=() r s e k n primaries=0
-    local ans fs fslabel maxlen part fsitems vgs_list=() v vg
+    local ans fs fslabel maxlen part fsitems vgs_list=() v vg rc
     disk=$(select_disk "$title" "Select the disk to create the partition on:") || return 0
 
-    if ! load_table "$disk"; then
+    load_table "$disk"
+    rc=$?
+    if (( rc == 2 )); then
+        ui_msg "$title" "$T_ERR"
+        return 0
+    fi
+    if (( rc != 0 )); then
         if disk_in_use "$disk"; then
             ui_msg "$title" "Disk $disk has no partition table but is in use (mounted, swap or LVM): cannot continue."
             return 0
         fi
-        sigs=$(fs_type "$disk")
+        sigs=$(dev_signatures "$disk")
         label_type=$(UI_NOTAGS=1 ui_menu "$title" "Disk $disk has no partition table.\nChoose the type of table to create:" \
             gpt "GPT (recommended: modern disks, UEFI, larger than 2 TiB)" \
             dos "MBR/DOS (compatible with old BIOSes, max 2 TiB)") || return 0
@@ -1979,7 +2107,7 @@ wizard_create() {
     fsitems=(ext4 "ext4    - Linux file system (recommended)"
         xfs "xfs     - Linux file system for large volumes (cannot be shrunk)"
         btrfs "btrfs   - Linux file system with snapshots"
-        vfat "FAT32   - works with Windows/macOS, USB sticks, EFI partitions"
+        vfat "FAT32   - works with Windows/macOS, USB sticks, EFI (FAT16 below 64 MiB)"
         ntfs "NTFS    - Windows file system"
         swap "swap    - swap space"
         lvm "LVM     - LVM physical volume"
@@ -2070,13 +2198,15 @@ wizard_delete() {
         wipe=0
     else
         t=$(fs_type "$part")
-        mnt=$(mountpoint_of "$part")
-        case $mnt in
-            / | /boot | /boot/efi | /efi | /usr | /var | /home)
-                ui_msg "$title" "Partition $part is mounted on $mnt and is used by the system: it cannot be deleted."
-                return 0
-                ;;
-        esac
+        mnt=$(mountpoints_of "$part" | paste -sd' ' -)
+        for k in $mnt; do
+            case $k in
+                / | /boot | /boot/efi | /efi | /usr | /var | /home)
+                    ui_msg "$title" "Partition $part is mounted on $k and is used by the system: it cannot be deleted."
+                    return 0
+                    ;;
+            esac
+        done
         if [[ -n $(dev_holders "$part") ]]; then
             if [[ $t == LVM2_member ]]; then
                 ui_msg "$title" "Partition $part is an LVM physical volume in use ($(dev_child "$part")).\nRemove it from its volume group first (pvmove + vgreduce)."
@@ -2106,8 +2236,8 @@ wizard_delete() {
     ui_confirm_typed "$title" "You are about to DELETE partition $part ($(human $(( T_SIZE[i] * T_SS ))), contents: ${t:-unknown}).\nALL THE DATA ON IT WILL BE LOST.$warnmsg" "$(basename "$part")" || return 0
 
     screen_start "$title"
-    if [[ -n $mnt ]] && ! run umount "$mnt"; then
-        err "Could not unmount $mnt: close the programs using it and try again."
+    if [[ -n $mnt ]] && ! unmount_all "$part"; then
+        err "Could not unmount $part from $mnt: close the programs using it and try again."
         pause
         return 0
     fi
@@ -2145,14 +2275,25 @@ wizard_rescan() {
         done
         info "You can now use \"Grow a partition\" or \"Create a new partition\"."
     else
-        info "$disk: $(human "$(dev_bytes "$disk")"), no partition table."
+        info "$disk ($(human "$(dev_bytes "$disk")")): $T_ERR"
     fi
     show_disk "$disk"
     pause
 }
 
+# Prints a warning when backup FILE was not taken from disk DEV (different
+# disk identifier), nothing otherwise.
+backup_id_warning() {
+    local f=$1 dev=$2 bid cid
+    bid=$(awk -F': *' '/^label-id:/ { print tolower($2); exit }' "$f")
+    cid=$(LC_ALL=C sfdisk --dump "$dev" 2>/dev/null | awk -F': *' '/^label-id:/ { print tolower($2); exit }')
+    if [[ -n $bid && $bid != "$cid" ]]; then
+        printf '%s' "\n\nWARNING: the identifier of disk $dev (${cid:-none}) differs from the one in the backup ($bid). The backup may come from a DIFFERENT disk: device names can change between boots. Restoring it on the wrong disk can make its data unreachable."
+    fi
+}
+
 wizard_restore() {
-    local title="Restore partition table" files=() items=() f tag dev
+    local title="Restore partition table" files=() items=() f tag dev idwarn
     mapfile -t files < <(ls -1t "$PW_BACKUP_DIR"/*.sfdisk 2>/dev/null)
     if (( ${#files[@]} == 0 )); then
         ui_msg "$title" "No backups found in $PW_BACKUP_DIR."
@@ -2173,7 +2314,8 @@ wizard_restore() {
         ui_msg "$title" "Disk $dev is in use (mounted partitions, swap or active LVM/LUKS).\n\nFor safety, a table can only be restored on a disk that is not in use: boot from a live USB or unmount the partitions.\n\nAlternatively, run manually:\n  sfdisk $dev < $f"
         return 0
     fi
-    ui_confirm_typed "$title" "The partition table of $dev will be replaced with:\n\n$(sed -n '/^\//p' "$f")\n\nThe data inside the partitions is not touched, but a wrong table can make it unreachable." "$(basename "$dev")" || return 0
+    idwarn=$(backup_id_warning "$f" "$dev")
+    ui_confirm_typed "$title" "The partition table of $dev ($(human "$(dev_bytes "$dev")")) will be replaced with:\n\n$(sed -n '/^\//p' "$f")\n\nThe data inside the partitions is not touched, but a wrong table can make it unreachable.$idwarn" "$(basename "$dev")" || return 0
     screen_start "$title"
     backup_table "$dev"
     run_input "$(<"$f")" sfdisk "$dev" && ok "Partition table restored."
@@ -2214,7 +2356,7 @@ main_menu() {
             9) break ;;
         esac
     done
-    [[ $PW_UI == whiptail && -t 1 ]] && clear
+    [[ $PW_UI == whiptail && -t 1 ]] && clear_screen
     info "Goodbye!"
 }
 
@@ -2327,7 +2469,7 @@ main() {
             ;;
         list)
             ensure_cmds "${PW_CORE_CMDS[@]}" || return 1
-            show_overview
+            show_overview 2>&1
             return 0
             ;;
     esac

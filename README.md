@@ -17,6 +17,9 @@ Run the script straight from GitHub:
 sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/pilippopilippo/linux-partition-manager/main/partition-wizard.sh)"
 ```
 
+Already root (for example after `su -` on a Debian installed without sudo)?
+Run the same command without `sudo`.
+
 On systems without `curl` (for example a minimal Debian) use `wget`:
 
 ```bash
@@ -71,7 +74,7 @@ The main menu offers:
 | XFS | yes, even mounted | no (XFS cannot shrink) | yes |
 | Btrfs | yes, even mounted | yes, even mounted | yes |
 | NTFS | yes, unmounted | yes, unmounted | yes |
-| FAT32 | no | no | yes |
+| FAT32 | no | no | yes (FAT16 below 64 MiB) |
 | swap | yes (UUID kept) | yes (UUID kept) | yes |
 | LVM physical volume | yes: `pvresize` + logical volume extension | no | yes |
 | LUKS (open encrypted volume) | yes: `cryptsetup resize` + contents | no | no |
@@ -118,7 +121,14 @@ before starting**. The script still does its best to reduce the risks:
   delete or overwrite data you have to type the device name;
 - `Ctrl+C` is ignored during critical operations, so that file systems and
   partition tables are never left half done;
-- it never deletes or unmounts system partitions (`/`, `/boot`, `/home`, ...);
+- it never deletes system partitions (`/`, `/boot`, `/home`, ...) nor any
+  partition that is still in use, and never unmounts the ones the running
+  system needs (`/`, `/usr`, `/var`, `/boot`);
+- before restoring a backup it checks that the backup was taken from the same
+  disk (disk identifier), because device names such as `sda`/`sdb` can change
+  between boots;
+- after every change it checks that the kernel sees the new partition layout
+  and tells you when a reboot is needed;
 - with `--dry-run` you can see exactly which commands would be run;
 - all text is plain ASCII, so it renders correctly even on consoles without a
   UTF-8 locale.
